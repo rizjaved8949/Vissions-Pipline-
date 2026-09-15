@@ -8,6 +8,10 @@ import { nitro } from "nitro/vite";
 
 const srcAlias = fileURLToPath(new URL("./src", import.meta.url));
 
+// Nitro deploy target. Vercel sets VERCEL=1 in its build container, so builds
+// there emit .vercel/output; everything else keeps the Cloudflare Worker build.
+const nitroPreset = process.env.NITRO_PRESET ?? (process.env.VERCEL ? "vercel" : "cloudflare-module");
+
 export default defineConfig(({ mode, command }) => {
   // Expose VITE_*-prefixed env vars as import.meta.env.* at build time.
   const env = loadEnv(mode, process.cwd(), "VITE_");
@@ -45,7 +49,7 @@ export default defineConfig(({ mode, command }) => {
         server: { entry: "server" },
       }),
       // nitro builds the server bundle; only needed for `vite build`, not dev.
-      ...(command === "build" ? [nitro({ preset: "cloudflare-module" })] : []),
+      ...(command === "build" ? [nitro({ preset: nitroPreset })] : []),
       viteReact(),
     ],
   };
