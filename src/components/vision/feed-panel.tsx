@@ -36,6 +36,28 @@ type FeedPanelProps = {
   aspect?: string;
   children?: React.ReactNode;
   onStatusChange?: (status: FeedStatus) => void;
+  /** When set, "Connect camera" streams this URL (e.g. a backend MJPEG feed)
+   *  instead of requesting the browser's own camera via getUserMedia. */
+  liveSrc?: string;
+  /** Called right before switching to the live backend stream (e.g. to start a session). */
+  onConnect?: () => Promise<void> | void;
+  /** Called when the session is stopped (e.g. to stop the backend session).
+   *  If it returns a promise, callers wait for it before reconnecting - so the
+   *  backend has actually released the camera before we ask for it again. */
+  onStop?: () => Promise<void> | void;
+  /** Checked before connecting the camera or accepting an upload. Return (or
+   *  resolve to) false to block the action (e.g. no one enrolled yet), which
+   *  fires onGuardBlocked. May be async - it's awaited fresh on every attempt,
+   *  so it should re-check live state rather than a locally cached flag. */
+  guard?: () => boolean | Promise<boolean>;
+  onGuardBlocked?: () => void;
+  /** When set, uploaded media is sent here for processing (e.g. a backend
+   *  face-recognition pass) instead of being previewed as-is. Must resolve to
+   *  an object URL for the processed result. */
+  onProcessMedia?: (file: File) => Promise<string>;
+  /** Called whenever the user downloads the processed result -
+   *  e.g. to clean up server-side data now that it's been saved locally. */
+  onDownload?: () => void;
 };
 
 const statusCopy: Record<FeedStatus, { text: string; tone: Tone }> = {
@@ -59,6 +81,13 @@ export function FeedPanel({
   aspect = "aspect-[16/9]",
   children,
   onStatusChange,
+  liveSrc,
+  onConnect,
+  onStop,
+  guard,
+  onGuardBlocked,
+  onProcessMedia,
+  onDownload,
 }: FeedPanelProps) {
   const [status, setStatus] = useState<FeedStatus>("demo");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -71,6 +100,7 @@ export function FeedPanel({
   } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [clock, setClock] = useState("--:--:--");
+  const [feedRetry, setFeedRetry] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -103,8 +133,68 @@ export function FeedPanel({
 
   useEffect(() => stopStream, [stopStream]);
 
+  const passesGuard = useCallback(async () => {
+    if (guard) {
+      const ok = await guard();
+      if (!ok) {
+        onGuardBlocked?.();
+        return false;
+      }
+    }
+    return true;
+  }, [guard, onGuardBlocked]);
+
   const connect = useCallback(
     async (preferred?: string) => {
+      if (!(await passesGuard())) return;
+
+      if (liveSrc) {
+        if (status === "live") {
+          // Reconnecting: release the backend's camera first so the OS device
+          // is actually free before we request it again - otherwise the browser
+          // permission check below fails with a "device busy" error.
+          setStatus("connecting");
+          await onStop?.();
+        }
+
+        setStatus("requesting");
+        if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+          setStatus("error");
+          setErrorText("This browser does not expose a camera device.");
+          return;
+        }
+        try {
+          // Ask the browser for camera permission first, purely as a user-facing
+          // confirmation step - the actual video comes from the backend feed below.
+          const permissionStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+          permissionStream.getTracks().forEach((t) => t.stop());
+        } catch {
+          setStatus("error");
+          setErrorText(
+            "Permission denied or no camera available. You can continue on the demo feed.",
+          );
+          toast.error("Camera permission denied");
+          return;
+        }
+
+        setStatus("connecting");
+        try {
+          await onConnect?.();
+          stopStream();
+          setUpload(null);
+          setStatus("live");
+          toast.success("Camera connected", { description: "Backend session started" });
+        } catch {
+          setStatus("error");
+          setErrorText("Could not start the backend session. You can continue on the demo feed.");
+          toast.error("Could not start the camera");
+        }
+        return;
+      }
+
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         setStatus("error");
         setErrorText("This browser does not expose a camera device.");
@@ -145,26 +235,48 @@ export function FeedPanel({
         toast.error("Could not start the camera");
       }
     },
-    [stopStream],
+    [stopStream, liveSrc, onConnect, onStop, status, passesGuard],
   );
 
-  const stopSession = () => {
+  const stopSession = async () => {
     stopStream();
     setStatus("stopped");
+    await onStop?.();
     toast("Session stopped");
   };
   const handleDownload = () => {
     if (!upload) return;
     const a = document.createElement("a");
-    a.href = upload.url; // swap for the processed-result URL once that exists
+    a.href = upload.url;
     a.download = upload.name;
     a.click();
+    onDownload?.();
   };
 
-  const handleFile = (file?: File) => {
+  const handleFile = async (file?: File) => {
     if (!file) return;
+    if (!(await passesGuard())) return;
+
     const kind = file.type.startsWith("video") ? "video" : "image";
     stopStream();
+
+    if (onProcessMedia) {
+      setStatus("connecting");
+      try {
+        const processedUrl = await onProcessMedia(file);
+        const base = file.name.replace(/\.[^./]+$/, "");
+        const outName = `${base}-processed.${kind === "video" ? "mp4" : "jpg"}`;
+        setUpload({ url: processedUrl, kind, name: outName });
+        setStatus("media");
+        toast.success("Media processed", { description: file.name });
+      } catch {
+        setStatus("error");
+        setErrorText("Could not process the uploaded media. You can continue on the demo feed.");
+        toast.error("Processing failed");
+      }
+      return;
+    }
+
     setUpload({ url: URL.createObjectURL(file), kind, name: file.name });
     setStatus("media");
     toast.success("Media loaded", { description: file.name });
@@ -207,7 +319,20 @@ export function FeedPanel({
           )}
         >
           {/* base layer */}
-          {status === "live" ? (
+          {status === "live" && liveSrc ? (
+            <img
+              key={feedRetry}
+              src={liveSrc}
+              alt={`${cameraCode} live feed`}
+              className="absolute inset-0 size-full object-cover"
+              onError={() => {
+                // The MJPEG connection can drop for transient reasons (network
+                // blip, tab backgrounding). The session/camera keeps running
+                // server-side, so just reconnect the stream, not the session.
+                setTimeout(() => setFeedRetry((n) => n + 1), 1000);
+              }}
+            />
+          ) : status === "live" ? (
             <video
               ref={videoRef}
               playsInline
@@ -321,7 +446,14 @@ export function FeedPanel({
           <Button size="sm" variant="outline" onClick={() => void connect()}>
             <Camera className="size-3.5" /> {status === "live" ? "Reconnect" : "Connect camera"}
           </Button>
-          <Button size="sm" variant="outline" onClick={() => fileRef.current?.click()}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={async () => {
+              if (!(await passesGuard())) return;
+              fileRef.current?.click();
+            }}
+          >
             <Upload className="size-3.5" /> Upload media
           </Button>
           {status === "media" && upload ? (
@@ -337,7 +469,7 @@ export function FeedPanel({
             onChange={(e) => handleFile(e.target.files?.[0])}
           />
 
-          {devices.length > 0 ? (
+          {devices.length > 0 && !liveSrc ? (
             <Select
               value={deviceId}
               onValueChange={(v) => {

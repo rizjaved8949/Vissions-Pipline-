@@ -14,48 +14,81 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 const ranges = ["Today", "Last 7 days", "Last 30 days", "Custom range"] as const;
+type Range = (typeof ranges)[number];
 
 export function DownloadDialog({
   reportName,
   trigger,
+  open: openProp,
+  onOpenChange,
+  /** Which Period options currently have data behind them. Ranges not
+   *  listed here render disabled/grayed-out rather than being removed -
+   *  they light up automatically once that much history actually exists. */
+  availableRanges = ranges,
+  /** When provided, replaces the fake demo generation with a real one -
+   *  called with the chosen format, expected to actually download the file. */
+  onGenerate,
+  /** Called when the dialog closes without generating a report (Cancel/X/
+   *  clicking outside) - e.g. to clean up data that was being held for this. */
+  onCancel,
 }: {
   reportName: string;
   trigger?: React.ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  availableRanges?: readonly Range[];
+  onGenerate?: (format: "PDF" | "CSV") => Promise<void>;
+  onCancel?: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [openState, setOpenState] = useState(false);
+  const open = openProp ?? openState;
   const [format, setFormat] = useState<"PDF" | "CSV">("PDF");
-  const [range, setRange] = useState<(typeof ranges)[number]>("Today");
+  const [range, setRange] = useState<Range>("Today");
   const [phase, setPhase] = useState<"idle" | "working" | "done">("idle");
 
-  const generate = () => {
+  const setOpen = (v: boolean) => {
+    if (!v && phase === "idle") onCancel?.();
+    setOpenState(v);
+    onOpenChange?.(v);
+    if (!v) setPhase("idle");
+  };
+
+  const generate = async () => {
+    if (onGenerate) {
+      setPhase("working");
+      try {
+        await onGenerate(format);
+        setPhase("done");
+        setTimeout(() => setOpen(false), 900);
+      } catch {
+        setPhase("idle");
+        toast.error("Could not generate the report");
+      }
+      return;
+    }
+
+    // No real generator wired up - fall back to the original demo behavior.
     setPhase("working");
     setTimeout(() => {
       setPhase("done");
       toast.success(`${reportName} ready`, {
         description: `${format} · ${range}`,
       });
-      setTimeout(() => {
-        setOpen(false);
-        setPhase("idle");
-      }, 900);
+      setTimeout(() => setOpen(false), 900);
     }, 1400);
   };
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(v) => {
-        setOpen(v);
-        if (!v) setPhase("idle");
-      }}
-    >
-      <DialogTrigger asChild>
-        {trigger ?? (
-          <Button size="sm">
-            <Download className="size-3.5" /> Download report
-          </Button>
-        )}
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={setOpen}>
+      {trigger !== null ? (
+        <DialogTrigger asChild>
+          {trigger ?? (
+            <Button size="sm">
+              <Download className="size-3.5" /> Download report
+            </Button>
+          )}
+        </DialogTrigger>
+      ) : null}
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{reportName}</DialogTitle>
@@ -97,24 +130,31 @@ export function DownloadDialog({
           <div className="space-y-2">
             <Label className="label-mono">Period</Label>
             <div className="flex flex-wrap gap-2">
-              {ranges.map((r) => (
-                <button
-                  key={r}
-                  onClick={() => setRange(r)}
-                  className={cn(
-                    "rounded-md px-2.5 py-1.5 text-[12px] font-medium ring-1 transition-colors",
-                    range === r
-                      ? "bg-ink text-elev ring-ink"
-                      : "bg-panel text-mute ring-line hover:text-ink",
-                  )}
-                >
-                  {r}
-                </button>
-              ))}
+              {ranges.map((r) => {
+                const available = availableRanges.includes(r);
+                return (
+                  <button
+                    key={r}
+                    disabled={!available}
+                    onClick={() => available && setRange(r)}
+                    title={available ? undefined : "No data for this period yet"}
+                    className={cn(
+                      "rounded-md px-2.5 py-1.5 text-[12px] font-medium ring-1 transition-colors",
+                      !available
+                        ? "cursor-not-allowed bg-panel text-faint/50 ring-line opacity-50"
+                        : range === r
+                          ? "bg-ink text-elev ring-ink"
+                          : "bg-panel text-mute ring-line hover:text-ink",
+                    )}
+                  >
+                    {r}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
-          <Button className="w-full" onClick={generate} disabled={phase !== "idle"}>
+          <Button className="w-full" onClick={() => void generate()} disabled={phase !== "idle"}>
             {phase === "working" ? (
               <>
                 <Loader2 className="size-4 animate-spin" /> Generating…
