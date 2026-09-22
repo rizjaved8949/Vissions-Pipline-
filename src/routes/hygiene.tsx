@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { CheckCircle2, HardHat, ShieldAlert, XCircle } from "lucide-react";
 import {
@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { FeedPanel } from "@/components/vision/feed-panel";
+import { FeedPanel, type FeedStatus } from "@/components/vision/feed-panel";
 import { DownloadDialog } from "@/components/vision/download-dialog";
 import { SettingsSheet } from "@/components/vision/settings-sheet";
 import {
@@ -33,6 +33,202 @@ import {
 } from "@/components/ui/select";
 import { complianceTrend, kitchenStaff, violations } from "@/lib/mock";
 import feedKitchen from "@/assets/feed-kitchen.jpg";
+
+/* ---------------- backend wiring ---------------- */
+
+const API_BASE = "http://localhost:8000";
+const KITCHEN_BASE = `${API_BASE}/api/kitchen`;
+
+type RequirementState = "compliant" | "violation" | "unknown";
+
+type PersonRequirement = {
+  state: RequirementState;
+  confidence: number;
+  evidence_type: string | null;
+};
+
+type KitchenPerson = {
+  track_id: number;
+  staff_label: string;
+  mask: PersonRequirement;
+  gloves: PersonRequirement;
+  hair_cover: PersonRequirement;
+  overall: RequirementState;
+};
+
+type RequirementSummary =
+  | {
+      supported: true;
+      compliant: number;
+      violation: number;
+      unknown: number;
+      known: number;
+      percentage: number | null;
+    }
+  | { supported: false; status: string };
+
+type KitchenViolation = {
+  event_id: string;
+  track_id: number;
+  staff_label: string;
+  requirement: "mask" | "gloves" | "hair_cover";
+  violation_type: string;
+  severity: "critical" | "warning";
+  started_at: string;
+  last_seen_at: string;
+};
+
+type TrendPoint = {
+  timestamp: string;
+  compliance_score: number | null;
+};
+
+type KitchenDashboard = {
+  session_id: string;
+  status: "queued" | "running" | "completed" | "stopped" | "failed";
+  camera_id: string | null;
+  summary: {
+    staff_detected: number;
+    fully_compliant: number;
+    open_violations: number;
+    compliance_score: number | null;
+  };
+  requirements: Record<string, RequirementSummary>;
+  persons: KitchenPerson[];
+  compliance_trend: TrendPoint[];
+};
+
+type KitchenSessionStatus = {
+  session_id: string;
+  status: "queued" | "running" | "completed" | "stopped" | "failed";
+  processed_frames: number;
+  total_frames: number | null;
+  error: string | null;
+};
+
+type ReportFormat = "PDF" | "CSV";
+const apiFormat = (format: ReportFormat) => (format === "PDF" ? "pdf" : "csv");
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function jsonOrThrow<T>(res: Response, fallback: string): Promise<T> {
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail || fallback);
+  }
+  return res.json();
+}
+
+async function startKitchenCamera(): Promise<{ session_id: string }> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/camera`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // "0" = default local webcam index, same source Attendance/Guard use.
+    body: JSON.stringify({ source: "0", camera_id: "CAM-03" }),
+  });
+  return jsonOrThrow(res, "Failed to start kitchen camera session");
+}
+
+async function stopKitchenSession(sessionId: string) {
+  try {
+    await fetch(`${KITCHEN_BASE}/sessions/${sessionId}/stop`, { method: "POST" });
+  } catch {
+    // Backend unreachable - nothing more we can do client-side.
+  }
+}
+
+async function fetchKitchenStatus(sessionId: string): Promise<KitchenSessionStatus> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}`);
+  return jsonOrThrow(res, "Failed to fetch session status");
+}
+
+async function waitForKitchenSession(
+  sessionId: string,
+  onProgress?: (status: KitchenSessionStatus) => void,
+): Promise<KitchenSessionStatus> {
+  for (;;) {
+    const status = await fetchKitchenStatus(sessionId);
+    onProgress?.(status);
+    if (
+      status.status === "completed" ||
+      status.status === "failed" ||
+      status.status === "stopped"
+    ) {
+      return status;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+}
+
+async function fetchKitchenDashboard(sessionId: string): Promise<KitchenDashboard> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}/dashboard`);
+  return jsonOrThrow(res, "Failed to fetch kitchen dashboard");
+}
+
+async function fetchKitchenViolations(sessionId: string): Promise<KitchenViolation[]> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}/violations?active_only=false`);
+  const data = await jsonOrThrow<{ violations: KitchenViolation[] }>(
+    res,
+    "Failed to fetch violations",
+  );
+  return data.violations;
+}
+
+async function fetchKitchenVideoUrl(sessionId: string): Promise<string> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}/video`);
+  if (!res.ok) throw new Error("Failed to fetch processed video");
+  return URL.createObjectURL(await res.blob());
+}
+
+async function createKitchenUpload(file: File): Promise<string> {
+  const body = new FormData();
+  body.append("file", file);
+  body.append("camera_id", "CAM-03");
+  const res = await fetch(`${KITCHEN_BASE}/sessions/upload`, { method: "POST", body });
+  const data = await jsonOrThrow<{ session_id: string }>(res, "Failed to upload video");
+  return data.session_id;
+}
+
+async function fetchKitchenReport(sessionId: string, format: ReportFormat) {
+  const res = await fetch(
+    `${KITCHEN_BASE}/sessions/${sessionId}/report?format=${apiFormat(format)}`,
+  );
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail || "Failed to generate report");
+  }
+  const blob = await res.blob();
+  return { blob, name: `${sessionId}-report.${apiFormat(format)}` };
+}
+
+function uploadProgressLabel(status: KitchenSessionStatus): string {
+  if (status.total_frames) {
+    const pct = Math.round((status.processed_frames / status.total_frames) * 100);
+    return `Processing video · ${pct}%`;
+  }
+  return "Processing video";
+}
+
+const VIOLATION_LABELS: Record<string, string> = {
+  no_mask: "Missing mask",
+  incorrect_mask: "Face mask lowered",
+  no_glove: "Missing gloves",
+  no_hairnet: "Hair cover not worn",
+  conflicting_evidence: "Conflicting PPE evidence",
+};
+
+function violationLabel(type: string): string {
+  return VIOLATION_LABELS[type] ?? type.replace(/_/g, " ");
+}
+
+/* ---------------- component ---------------- */
 
 export const Route = createFileRoute("/hygiene")({
   head: () => ({
@@ -61,33 +257,169 @@ const categories = [
 ];
 
 function Hygiene() {
-  const [severity, setSeverity] = useState("all");
-  const list = violations.filter((v) => severity === "all" || v.severity === severity);
-  const compliant = kitchenStaff.filter((s) => s.mask && s.gloves && s.hairCover).length;
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  const backendConnected = feedStatus === "live" || feedStatus === "media";
 
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [reportSessionId, setReportSessionId] = useState<string | null>(null);
+  const [sessionReportOpen, setSessionReportOpen] = useState(false);
+  const [dashboard, setDashboard] = useState<KitchenDashboard | null>(null);
+  const [violationsLog, setViolationsLog] = useState<KitchenViolation[]>([]);
+  const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
+
+  // Poll the dashboard + violation log every second while a live session is
+  // running, same cadence Attendance/Guard use for their status polling.
+  useEffect(() => {
+    if (feedStatus !== "live" || !sessionId) {
+      setDashboard(null);
+      setViolationsLog([]);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await fetchKitchenDashboard(sessionId);
+        if (!cancelled) setDashboard(data);
+      } catch {
+        // backend unreachable, keep last known dashboard
+      }
+      try {
+        const log = await fetchKitchenViolations(sessionId);
+        if (!cancelled) setViolationsLog(log);
+      } catch {
+        // backend unreachable, keep last known log
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [feedStatus, sessionId]);
+
+  // A stale processed session's dashboard shouldn't linger once the user
+  // leaves "media".
+  useEffect(() => {
+    if (feedStatus !== "media" && feedStatus !== "live") {
+      setDashboard(null);
+      setViolationsLog([]);
+    }
+  }, [feedStatus]);
+
+  const [severity, setSeverity] = useState("all");
   const [complianceFilter, setComplianceFilter] = useState("all");
-  const filteredStaff = kitchenStaff.filter((s) => {
+
+  // Real per-person compliance when connected (live or a processed upload),
+  // the existing demo roster otherwise.
+  const staffList = useMemo(() => {
+    if (!dashboard) return kitchenStaff;
+    return dashboard.persons.map((p) => ({
+      id: String(p.track_id),
+      name: p.staff_label,
+      station: `Track ${p.track_id}`,
+      mask: p.mask.state === "compliant",
+      gloves: p.gloves.state === "compliant",
+      hairCover: p.hair_cover.state === "compliant",
+    }));
+  }, [dashboard]);
+
+  const compliant = dashboard
+    ? dashboard.summary.fully_compliant
+    : kitchenStaff.filter((s) => s.mask && s.gloves && s.hairCover).length;
+
+  const list = (dashboard ? violationsLog : violations).filter((v) => {
+    if (severity === "all") return true;
+    return "severity" in v && v.severity === severity;
+  });
+
+  const filteredStaff = staffList.filter((s) => {
     const isCompliant = s.mask && s.gloves && s.hairCover;
     if (complianceFilter === "compliant") return isCompliant;
     if (complianceFilter === "violation") return !isCompliant;
     return true;
   });
 
+  const requirementRows = dashboard
+    ? (
+        [
+          ["Face mask", dashboard.requirements["mask"]],
+          ["Gloves", dashboard.requirements["gloves"]],
+          ["Hair cover", dashboard.requirements["hair_cover"]],
+          ["Apron", dashboard.requirements["apron"]],
+        ] as const
+      ).map(([label, req]) => {
+        if (!req || !req.supported) {
+          return { key: label, text: "Not tracked", pct: 0 };
+        }
+        if (req.known === 0) {
+          return { key: label, text: "No data yet", pct: 0 };
+        }
+        const pct = Math.max(0, Math.min(100, Math.round(req.percentage ?? 0)));
+        return { key: label, text: `${req.compliant}/${req.known} · ${pct}%`, pct };
+      })
+    : categories.map((c) => {
+        const pct = Math.round((c.worn / c.total) * 100);
+        return { key: c.key, text: `${c.worn}/${c.total} · ${pct}%`, pct };
+      });
+
+  const trendData =
+    dashboard && dashboard.compliance_trend.length > 0
+      ? dashboard.compliance_trend.map((t) => ({
+          hour: new Date(t.timestamp).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          score: t.compliance_score ?? 0,
+        }))
+      : complianceTrend;
+
   return (
     <>
       <SectionTitle title="Kitchen Line · Hygiene & PPE" sub="CAM-03 · PPE COMPLIANCE · SHIFT 2">
         <SettingsSheet
           pipelineName="Kitchen Hygiene"
-          extra={[{ title: "Snapshot every violation", help: "Save a still image with each event.", defaultOn: true }]}
+          extra={[
+            {
+              title: "Snapshot every violation",
+              help: "Save a still image with each event.",
+              defaultOn: true,
+            },
+          ]}
         />
-        <DownloadDialog reportName="Compliance report" />
+        <DownloadDialog
+          reportName="Compliance report"
+          {...(reportSessionId
+            ? {
+                onGenerate: async (format: ReportFormat) => {
+                  const { blob, name } = await fetchKitchenReport(reportSessionId, format);
+                  downloadBlob(blob, name);
+                },
+              }
+            : {})}
+        />
       </SectionTitle>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Staff detected" value={kitchenStaff.length} hint="on the line now" />
+        <Kpi
+          label="Staff detected"
+          value={dashboard ? dashboard.summary.staff_detected : kitchenStaff.length}
+          hint="on the line now"
+        />
         <Kpi label="Fully compliant" value={compliant} tone="moss" hint="all PPE worn" />
-        <Kpi label="Open violations" value={2} tone="rose" hint="needs supervisor" />
-        <Kpi label="Compliance score" value={84} unit="%" tone="amber" hint="target 95%" />
+        <Kpi
+          label="Open violations"
+          value={dashboard ? dashboard.summary.open_violations : 2}
+          tone="rose"
+          hint="needs supervisor"
+        />
+        <Kpi
+          label="Compliance score"
+          value={dashboard ? Math.round(dashboard.summary.compliance_score ?? 0) : 84}
+          unit="%"
+          tone="amber"
+          hint="target 95%"
+        />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -97,29 +429,91 @@ function Hygiene() {
             cameraCode="CAM-03"
             sample={feedKitchen}
             sampleAlt="Commercial kitchen camera feed"
+            liveSrc={`${KITCHEN_BASE}/sessions/current/stream`}
+            {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
+            onStatusChange={setFeedStatus}
+            onConnect={async () => {
+              const { session_id } = await startKitchenCamera();
+              setSessionId(session_id);
+              setReportSessionId(session_id);
+            }}
+            onStop={async () => {
+              const id = sessionId;
+              setSessionId(null);
+              if (id) {
+                await stopKitchenSession(id);
+                setReportSessionId(id);
+                setSessionReportOpen(true);
+              }
+            }}
+            onProcessMedia={async (file) => {
+              setUploadLabel("Uploading video");
+              try {
+                const newSessionId = await createKitchenUpload(file);
+                const status = await waitForKitchenSession(newSessionId, (s) =>
+                  setUploadLabel(uploadProgressLabel(s)),
+                );
+                if (status.status === "failed") {
+                  throw new Error(status.error || "Kitchen processing failed");
+                }
+                setUploadLabel("Loading processed video");
+                const [url, dashboardData, log] = await Promise.all([
+                  fetchKitchenVideoUrl(newSessionId),
+                  fetchKitchenDashboard(newSessionId),
+                  fetchKitchenViolations(newSessionId),
+                ]);
+                setSessionId(newSessionId);
+                setReportSessionId(newSessionId);
+                setDashboard(dashboardData);
+                setViolationsLog(log);
+                return url;
+              } finally {
+                setUploadLabel(undefined);
+              }
+            }}
             overlay={
-              <>
-                {kitchenStaff.map((s) => {
-                  const ok = s.mask && s.gloves && s.hairCover;
-                  const missing = [
-                    !s.mask && "NO MASK",
-                    !s.gloves && "NO GLOVES",
-                    !s.hairCover && "NO HAIR COVER",
-                  ].filter(Boolean) as string[];
-                  return (
-                    <DetectionBox
-                      key={s.id}
-                      left={s.left}
-                      top={s.top}
-                      width={s.width}
-                      tone={ok ? "moss" : "rose"}
-                      label={`${s.station} · ${ok ? "PPE OK" : "VIOLATION"}`}
-                      sublabel={ok ? "MASK · GLOVES · COVER" : missing.join(" · ")}
-                    />
-                  );
-                })}
-              </>
+              feedStatus === "live" || feedStatus === "media" ? undefined : (
+                <>
+                  {kitchenStaff.map((s) => {
+                    const ok = s.mask && s.gloves && s.hairCover;
+                    const missing = [
+                      !s.mask && "NO MASK",
+                      !s.gloves && "NO GLOVES",
+                      !s.hairCover && "NO HAIR COVER",
+                    ].filter(Boolean) as string[];
+                    return (
+                      <DetectionBox
+                        key={s.id}
+                        left={s.left}
+                        top={s.top}
+                        width={s.width}
+                        tone={ok ? "moss" : "rose"}
+                        label={`${s.station} · ${ok ? "PPE OK" : "VIOLATION"}`}
+                        sublabel={ok ? "MASK · GLOVES · COVER" : missing.join(" · ")}
+                      />
+                    );
+                  })}
+                </>
+              )
             }
+          />
+
+          {/* Fully dialog-controlled (no visible trigger) - opened
+              programmatically right after Stop, same pattern Attendance and
+              Guard use. */}
+          <DownloadDialog
+            reportName="Session report"
+            trigger={null}
+            open={sessionReportOpen}
+            onOpenChange={setSessionReportOpen}
+            {...(reportSessionId
+              ? {
+                  onGenerate: async (format: ReportFormat) => {
+                    const { blob, name } = await fetchKitchenReport(reportSessionId, format);
+                    downloadBlob(blob, name);
+                  },
+                }
+              : {})}
           />
 
           <Panel className="overflow-hidden">
@@ -135,7 +529,7 @@ function Hygiene() {
                 </SelectContent>
               </Select>
             </PanelHead>
-            <div className="divide-y divide-line">
+            <div className="max-h-[420px] divide-y divide-line overflow-y-auto">
               {filteredStaff.map((s) => {
                 const items = [
                   { label: "Mask", ok: s.mask },
@@ -158,10 +552,16 @@ function Hygiene() {
                         <span
                           key={i.label}
                           className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium ring-1 ${
-                            i.ok ? "bg-moss/10 text-moss ring-moss/20" : "bg-rose/10 text-rose ring-rose/20"
+                            i.ok
+                              ? "bg-moss/10 text-moss ring-moss/20"
+                              : "bg-rose/10 text-rose ring-rose/20"
                           }`}
                         >
-                          {i.ok ? <CheckCircle2 className="size-3" /> : <XCircle className="size-3" />}
+                          {i.ok ? (
+                            <CheckCircle2 className="size-3" />
+                          ) : (
+                            <XCircle className="size-3" />
+                          )}
                           {i.label}
                         </span>
                       ))}
@@ -169,6 +569,11 @@ function Hygiene() {
                   </div>
                 );
               })}
+              {backendConnected && filteredStaff.length === 0 ? (
+                <p className="px-4 py-6 text-center text-[12px] text-mute">
+                  No staff detected {feedStatus === "live" ? "yet" : "in this video"}.
+                </p>
+              ) : null}
             </div>
           </Panel>
         </div>
@@ -177,20 +582,15 @@ function Hygiene() {
           <Panel className="p-4">
             <p className="label-mono">Compliance by requirement</p>
             <div className="mt-4 space-y-3">
-              {categories.map((c) => {
-                const pct = Math.round((c.worn / c.total) * 100);
-                return (
-                  <div key={c.key}>
-                    <div className="flex items-center justify-between text-[11px]">
-                      <span className="font-medium">{c.key}</span>
-                      <span className="font-mono text-mute">
-                        {c.worn}/{c.total} · {pct}%
-                      </span>
-                    </div>
-                    <Progress value={pct} className="mt-1.5 h-1.5" />
+              {requirementRows.map((c) => (
+                <div key={c.key}>
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-medium">{c.key}</span>
+                    <span className="font-mono text-mute">{c.text}</span>
                   </div>
-                );
-              })}
+                  <Progress value={c.pct} className="mt-1.5 h-1.5" />
+                </div>
+              ))}
             </div>
           </Panel>
 
@@ -198,7 +598,7 @@ function Hygiene() {
             <p className="label-mono">Compliance score today</p>
             <div className="mt-3 h-[140px]">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={complianceTrend} margin={{ top: 4, right: 4, bottom: 0, left: -22 }}>
+                <AreaChart data={trendData} margin={{ top: 4, right: 4, bottom: 0, left: -22 }}>
                   <defs>
                     <linearGradient id="hg" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--amber)" stopOpacity={0.35} />
@@ -256,24 +656,44 @@ function Hygiene() {
               <EmptyState
                 icon={<ShieldAlert className="size-5" />}
                 title="No violations in this view"
-                body="Everything on the line is compliant right now."
+                body={
+                  backendConnected
+                    ? "No PPE violations recorded for this session."
+                    : "Everything on the line is compliant right now."
+                }
               />
             ) : (
-              <div className="divide-y divide-line">
-                {list.map((v) => (
-                  <div key={v.id} className="row-in flex items-start gap-3 px-4 py-3">
-                    <span className="grid size-10 shrink-0 place-items-center rounded-md bg-panel ring-1 ring-line">
-                      <HardHat className="size-4 text-mute" />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-[12px] font-semibold">{v.issue}</p>
-                      <p className="truncate font-mono text-[10px] text-mute">
-                        {v.staff} · {v.camera} · {v.time}
-                      </p>
+              <div className="max-h-[420px] divide-y divide-line overflow-y-auto">
+                {list.map((v) => {
+                  const display =
+                    "violation_type" in v
+                      ? {
+                          id: v.event_id,
+                          issue: violationLabel(v.violation_type),
+                          staff: v.staff_label,
+                          camera: dashboard?.camera_id ?? "—",
+                          time: new Date(v.last_seen_at).toLocaleTimeString([], {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          }),
+                          severity: v.severity as "critical" | "warning" | "info",
+                        }
+                      : v;
+                  return (
+                    <div key={display.id} className="row-in flex items-start gap-3 px-4 py-3">
+                      <span className="grid size-10 shrink-0 place-items-center rounded-md bg-panel ring-1 ring-line">
+                        <HardHat className="size-4 text-mute" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[12px] font-semibold">{display.issue}</p>
+                        <p className="truncate font-mono text-[10px] text-mute">
+                          {display.staff} · {display.camera} · {display.time}
+                        </p>
+                      </div>
+                      <SeverityChip severity={display.severity} />
                     </div>
-                    <SeverityChip severity={v.severity} />
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </Panel>

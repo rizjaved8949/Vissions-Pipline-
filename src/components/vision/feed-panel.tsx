@@ -55,9 +55,19 @@ type FeedPanelProps = {
    *  face-recognition pass) instead of being previewed as-is. Must resolve to
    *  an object URL for the processed result. */
   onProcessMedia?: (file: File) => Promise<string>;
+  /** Overrides the "Connecting camera" label shown while awaiting onConnect
+   *  or onProcessMedia - e.g. "Processing video" for a backend job that isn't
+   *  actually a camera connection. Can change while connecting/processing is
+   *  in progress (e.g. to show live percent complete). */
+  busyLabel?: string;
   /** Called whenever the user downloads the processed result -
    *  e.g. to clean up server-side data now that it's been saved locally. */
   onDownload?: () => void;
+  /** Shows liveSrc as the base layer even outside status "live" - for a
+   *  backend that processes an upload in place and streams it through the
+   *  same live feed rather than handing back one finished file (e.g. a
+   *  session that keeps running after onProcessMedia resolves). */
+  liveOverride?: boolean;
 };
 
 const statusCopy: Record<FeedStatus, { text: string; tone: Tone }> = {
@@ -88,6 +98,8 @@ export function FeedPanel({
   onGuardBlocked,
   onProcessMedia,
   onDownload,
+  busyLabel,
+  liveOverride = false,
 }: FeedPanelProps) {
   const [status, setStatus] = useState<FeedStatus>("demo");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -283,8 +295,9 @@ export function FeedPanel({
   };
 
   const info = statusCopy[status];
+  const showLiveSrc = (status === "live" || (liveOverride && status === "media")) && !!liveSrc;
   const showOverlay = status === "live" || status === "demo" || status === "media";
-  const isLive = status === "live" || status === "demo";
+  const isLive = status === "live" || status === "demo" || (liveOverride && status === "media");
 
   return (
     <section className="rounded-xl bg-elev ring-1 ring-line">
@@ -319,7 +332,7 @@ export function FeedPanel({
           )}
         >
           {/* base layer */}
-          {status === "live" && liveSrc ? (
+          {showLiveSrc ? (
             <img
               key={feedRetry}
               src={liveSrc}
@@ -389,7 +402,9 @@ export function FeedPanel({
               <div className="flex flex-col items-center gap-2">
                 <Loader2 className="size-5 animate-spin" />
                 <p className="font-mono text-[11px] uppercase tracking-widest">
-                  {status === "requesting" ? "Awaiting permission" : "Connecting camera"}
+                  {status === "requesting"
+                    ? "Awaiting permission"
+                    : (busyLabel ?? "Connecting camera")}
                 </p>
               </div>
             </div>
