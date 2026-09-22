@@ -420,7 +420,6 @@ function Guard() {
   const [current, setCurrent] = useState<GuardState>("on-duty");
 
   const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
-  const backendConnected = feedStatus === "live" || feedStatus === "media";
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reportSessionId, setReportSessionId] = useState<string | null>(null);
@@ -431,6 +430,13 @@ function Guard() {
   const [jobSummary, setJobSummary] = useState<JobSummary | null>(null);
   const [jobEvents, setJobEvents] = useState<RuleEvent[]>([]);
   const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
+  const [processingJobId, setProcessingJobId] = useState<string | null>(null);
+
+  // True the moment a real camera/job is in play, including while an upload
+  // is still processing - not just once results are fully ready. Keeps the
+  // UI from falling back to demo mock data mid-processing (it shows real
+  // panels with "no data yet" instead, once jobSummary/liveState land).
+  const backendConnected = feedStatus === "live" || feedStatus === "media" || !!processingJobId;
 
   // Health of the backend's own detection/tracking/etc. modules for whichever
   // session or job is active - lets the UI say *why* nothing was detected
@@ -486,6 +492,17 @@ function Guard() {
     }
   }, [feedStatus]);
 
+  // Only turn processingJobId off once feedStatus itself has actually left
+  // "connecting" - never from inside onProcessMedia's own finally block,
+  // which would create a gap where processingJobId is already null but
+  // feedStatus hasn't caught up yet, making backendConnected flicker back
+  // to false (and panels flash demo data) right as the real result is ready.
+  useEffect(() => {
+    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
+      setProcessingJobId(null);
+    }
+  }, [feedStatus]);
+
   // Real per-instant state while connected; the manual "Simulate state"
   // buttons still drive `current` for the demo feed exactly as before.
   const displayState: GuardState = backendConnected
@@ -509,8 +526,20 @@ function Guard() {
 
   const [eventSeverity, setEventSeverity] = useState("all");
 
-  // Real aggregate stats when connected (live or a processed job), null in demo.
+  // Real aggregate stats whenever a real camera/job is in play, including
+  // while a job is still processing (all zero until jobSummary lands) -
+  // never demo numbers past that point. Null only in true demo mode.
   const guardStats = useMemo(() => {
+    if (!backendConnected) return null;
+    const emptyGuardStats = {
+      dutySeconds: 0,
+      alertSeconds: 0,
+      inactiveSeconds: 0,
+      sleepSeconds: 0,
+      absenceSeconds: 0,
+      sleepEvents: 0,
+      absenceEvents: 0,
+    };
     if (feedStatus === "live" && liveState) {
       const fps = liveState.analysis_fps || 3;
       const stats = liveState.stats;
@@ -536,10 +565,10 @@ function Guard() {
         absenceEvents: eventCount(jobEvents, "absence"),
       };
     }
-    return null;
-  }, [feedStatus, liveState, liveEvents, jobSummary, jobEvents]);
+    return emptyGuardStats;
+  }, [backendConnected, feedStatus, liveState, liveEvents, jobSummary, jobEvents]);
 
-  const realEvents = feedStatus === "live" ? liveEvents : feedStatus === "media" ? jobEvents : null;
+  const realEvents = backendConnected ? (feedStatus === "live" ? liveEvents : jobEvents) : null;
 
   const timelineEntries = useMemo(() => {
     if (!realEvents) return guardTimeline;
@@ -648,7 +677,12 @@ function Guard() {
             cameraCode="CAM-09"
             sample={feedGuard}
             sampleAlt="Security guard post camera feed"
-            liveSrc={`${GUARD_BASE}/live/current/stream`}
+            liveSrc={
+              processingJobId
+                ? `${GUARD_BASE}/jobs/${processingJobId}/stream`
+                : `${GUARD_BASE}/live/current/stream`
+            }
+            liveOverride={!!processingJobId}
             {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
             onStatusChange={setFeedStatus}
             onConnect={async () => {
@@ -665,6 +699,7 @@ function Guard() {
               setUploadLabel("Uploading video");
               try {
                 const newJobId = await createGuardJob(file);
+                setProcessingJobId(newJobId);
                 const status = await waitForGuardJob(newJobId, (s) =>
                   setUploadLabel(jobProgressLabel(s)),
                 );
@@ -684,12 +719,16 @@ function Guard() {
                 setModuleHealth(health);
                 return url;
               } finally {
+                // processingJobId itself is cleared by the feedStatus effect
+                // above, once FeedPanel actually reflects the outcome - not
+                // here.
                 setUploadLabel(undefined);
               }
             }}
             overlay={
-              feedStatus === "live" || feedStatus === "media" ? undefined : displayState ===
-                "absent" ? (
+              feedStatus === "live" ||
+              feedStatus === "media" ||
+              processingJobId ? undefined : displayState === "absent" ? (
                 <div className="absolute inset-x-6 bottom-6 rounded-md bg-rose/90 px-3 py-2 text-center font-mono text-[11px] font-semibold uppercase tracking-widest text-elev">
                   No person detected at post
                 </div>

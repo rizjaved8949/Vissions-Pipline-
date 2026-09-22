@@ -258,7 +258,6 @@ const categories = [
 
 function Hygiene() {
   const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
-  const backendConnected = feedStatus === "live" || feedStatus === "media";
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reportSessionId, setReportSessionId] = useState<string | null>(null);
@@ -266,13 +265,24 @@ function Hygiene() {
   const [dashboard, setDashboard] = useState<KitchenDashboard | null>(null);
   const [violationsLog, setViolationsLog] = useState<KitchenViolation[]>([]);
   const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
+  const [processingUpload, setProcessingUpload] = useState(false);
+
+  // True the moment a real camera/upload is in play, including while an
+  // upload is still processing - not just once results are ready. Keeps the
+  // panels from falling back to demo mock data mid-processing (they show
+  // real, empty-until-populated panels instead).
+  const backendConnected = feedStatus === "live" || feedStatus === "media" || processingUpload;
 
   // Poll the dashboard + violation log every second while a live session is
   // running, same cadence Attendance/Guard use for their status polling.
+  // Must NOT clear dashboard/violationsLog here: sessionId is also set for a
+  // just-finished upload (at the same moment as the real dashboard/log from
+  // onProcessMedia), which re-triggers this effect while feedStatus hasn't
+  // caught up to "media" yet - wiping the real result right back to null.
+  // Cleanup on a genuine disconnect is handled by the feedStatus-only effect
+  // below instead.
   useEffect(() => {
     if (feedStatus !== "live" || !sessionId) {
-      setDashboard(null);
-      setViolationsLog([]);
       return;
     }
     let cancelled = false;
@@ -307,13 +317,28 @@ function Hygiene() {
     }
   }, [feedStatus]);
 
+  // Only turn processingUpload off once feedStatus itself has actually left
+  // "connecting" - never on a timer or from inside onProcessMedia's own
+  // finally block, which would create a gap where processingUpload is
+  // already false but feedStatus hasn't caught up yet, making
+  // backendConnected flicker back to false (and panels flash demo data)
+  // right as the real result is ready.
+  useEffect(() => {
+    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
+      setProcessingUpload(false);
+    }
+  }, [feedStatus]);
+
   const [severity, setSeverity] = useState("all");
   const [complianceFilter, setComplianceFilter] = useState("all");
 
-  // Real per-person compliance when connected (live or a processed upload),
-  // the existing demo roster otherwise.
+  // Real per-person compliance when connected (live or a processing/processed
+  // upload) - empty until the backend actually has people to report, never
+  // the demo roster once we're past demo mode. Demo roster only outside of
+  // any real connection.
   const staffList = useMemo(() => {
-    if (!dashboard) return kitchenStaff;
+    if (!backendConnected) return kitchenStaff;
+    if (!dashboard) return [];
     return dashboard.persons.map((p) => ({
       id: String(p.track_id),
       name: p.staff_label,
@@ -322,13 +347,13 @@ function Hygiene() {
       gloves: p.gloves.state === "compliant",
       hairCover: p.hair_cover.state === "compliant",
     }));
-  }, [dashboard]);
+  }, [backendConnected, dashboard]);
 
-  const compliant = dashboard
-    ? dashboard.summary.fully_compliant
+  const compliant = backendConnected
+    ? (dashboard?.summary.fully_compliant ?? 0)
     : kitchenStaff.filter((s) => s.mask && s.gloves && s.hairCover).length;
 
-  const list = (dashboard ? violationsLog : violations).filter((v) => {
+  const list = (backendConnected ? violationsLog : violations).filter((v) => {
     if (severity === "all") return true;
     return "severity" in v && v.severity === severity;
   });
@@ -340,31 +365,37 @@ function Hygiene() {
     return true;
   });
 
-  const requirementRows = dashboard
-    ? (
-        [
-          ["Face mask", dashboard.requirements["mask"]],
-          ["Gloves", dashboard.requirements["gloves"]],
-          ["Hair cover", dashboard.requirements["hair_cover"]],
-          ["Apron", dashboard.requirements["apron"]],
-        ] as const
-      ).map(([label, req]) => {
-        if (!req || !req.supported) {
-          return { key: label, text: "Not tracked", pct: 0 };
-        }
-        if (req.known === 0) {
-          return { key: label, text: "No data yet", pct: 0 };
-        }
-        const pct = Math.max(0, Math.min(100, Math.round(req.percentage ?? 0)));
-        return { key: label, text: `${req.compliant}/${req.known} · ${pct}%`, pct };
-      })
+  const requirementRows = backendConnected
+    ? dashboard
+      ? (
+          [
+            ["Face mask", dashboard.requirements["mask"]],
+            ["Gloves", dashboard.requirements["gloves"]],
+            ["Hair cover", dashboard.requirements["hair_cover"]],
+            ["Apron", dashboard.requirements["apron"]],
+          ] as const
+        ).map(([label, req]) => {
+          if (!req || !req.supported) {
+            return { key: label, text: "Not tracked", pct: 0 };
+          }
+          if (req.known === 0) {
+            return { key: label, text: "No data yet", pct: 0 };
+          }
+          const pct = Math.max(0, Math.min(100, Math.round(req.percentage ?? 0)));
+          return { key: label, text: `${req.compliant}/${req.known} · ${pct}%`, pct };
+        })
+      : ["Face mask", "Gloves", "Hair cover", "Apron"].map((label) => ({
+          key: label,
+          text: "Processing…",
+          pct: 0,
+        }))
     : categories.map((c) => {
         const pct = Math.round((c.worn / c.total) * 100);
         return { key: c.key, text: `${c.worn}/${c.total} · ${pct}%`, pct };
       });
 
-  const trendData =
-    dashboard && dashboard.compliance_trend.length > 0
+  const trendData = backendConnected
+    ? dashboard && dashboard.compliance_trend.length > 0
       ? dashboard.compliance_trend.map((t) => ({
           hour: new Date(t.timestamp).toLocaleTimeString([], {
             hour: "2-digit",
@@ -372,7 +403,8 @@ function Hygiene() {
           }),
           score: t.compliance_score ?? 0,
         }))
-      : complianceTrend;
+      : []
+    : complianceTrend;
 
   return (
     <>
@@ -403,19 +435,19 @@ function Hygiene() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Kpi
           label="Staff detected"
-          value={dashboard ? dashboard.summary.staff_detected : kitchenStaff.length}
+          value={backendConnected ? (dashboard?.summary.staff_detected ?? 0) : kitchenStaff.length}
           hint="on the line now"
         />
         <Kpi label="Fully compliant" value={compliant} tone="moss" hint="all PPE worn" />
         <Kpi
           label="Open violations"
-          value={dashboard ? dashboard.summary.open_violations : 2}
+          value={backendConnected ? (dashboard?.summary.open_violations ?? 0) : 2}
           tone="rose"
           hint="needs supervisor"
         />
         <Kpi
           label="Compliance score"
-          value={dashboard ? Math.round(dashboard.summary.compliance_score ?? 0) : 84}
+          value={backendConnected ? Math.round(dashboard?.summary.compliance_score ?? 0) : 84}
           unit="%"
           tone="amber"
           hint="target 95%"
@@ -430,6 +462,7 @@ function Hygiene() {
             sample={feedKitchen}
             sampleAlt="Commercial kitchen camera feed"
             liveSrc={`${KITCHEN_BASE}/sessions/current/stream`}
+            liveOverride={processingUpload}
             {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
             onStatusChange={setFeedStatus}
             onConnect={async () => {
@@ -448,6 +481,7 @@ function Hygiene() {
             }}
             onProcessMedia={async (file) => {
               setUploadLabel("Uploading video");
+              setProcessingUpload(true);
               try {
                 const newSessionId = await createKitchenUpload(file);
                 const status = await waitForKitchenSession(newSessionId, (s) =>
@@ -468,11 +502,14 @@ function Hygiene() {
                 setViolationsLog(log);
                 return url;
               } finally {
+                // processingUpload itself is cleared by the feedStatus
+                // effect above, once FeedPanel actually reflects the
+                // outcome - not here.
                 setUploadLabel(undefined);
               }
             }}
             overlay={
-              feedStatus === "live" || feedStatus === "media" ? undefined : (
+              feedStatus === "live" || feedStatus === "media" || processingUpload ? undefined : (
                 <>
                   {kitchenStaff.map((s) => {
                     const ok = s.mask && s.gloves && s.hairCover;

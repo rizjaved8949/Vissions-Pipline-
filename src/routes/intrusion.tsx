@@ -168,7 +168,6 @@ function Intrusion() {
   const [breach, setBreach] = useState(false);
 
   const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
-  const backendConnected = feedStatus === "live" || feedStatus === "media";
 
   const [zoneFrame, setZoneFrame] = useState<ZoneFrame | null>(null);
   const [savedZones, setSavedZones] = useState<DrawnZone[]>([]);
@@ -179,6 +178,17 @@ function Intrusion() {
   const [reportOpen, setReportOpen] = useState(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
+  // True from the moment an upload starts until its replay video is ready -
+  // keeps every real panel/KPI showing real (if empty) data through zone
+  // drawing and monitoring, instead of falling back to demo mock data while
+  // FeedPanel itself is still sitting in "connecting".
+  const [uploadActive, setUploadActive] = useState(false);
+  // Holds the pending onProcessMedia resolver for an upload flow, fulfilled
+  // only once the session actually finishes and a replayable video exists -
+  // never while it's still being processed.
+  const pendingUploadResolve = useRef<((url: string) => void) | null>(null);
+
+  const backendConnected = feedStatus === "live" || feedStatus === "media" || uploadActive;
   const drawingZones = backendConnected && zoneFrame && !sessionActive;
 
   const resetZoneState = () => {
@@ -187,11 +197,60 @@ function Intrusion() {
     setCurrentPoints([]);
     setSessionActive(false);
     setStatus(null);
+    setUploadActive(false);
+    pendingUploadResolve.current = null;
   };
 
+  // Reset on a genuine disconnect only - not merely because uploadActive
+  // hasn't caught up with feedStatus yet (there's a brief gap between the
+  // upload's promise resolving and FeedPanel's status actually flipping to
+  // "media" that must not be mistaken for a disconnect mid-transition).
   useEffect(() => {
-    if (!backendConnected) resetZoneState();
-  }, [backendConnected]);
+    if (
+      feedStatus === "idle" ||
+      feedStatus === "demo" ||
+      feedStatus === "stopped" ||
+      feedStatus === "error"
+    ) {
+      resetZoneState();
+    }
+  }, [feedStatus]);
+
+  // Only turn uploadActive off once feedStatus itself has actually left
+  // "connecting" - never proactively from finalizeSession, which would
+  // create a gap where uploadActive is already false but feedStatus hasn't
+  // caught up yet, making backendConnected flicker back to false (and
+  // panels flash demo data) right as the real result is ready.
+  useEffect(() => {
+    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
+      setUploadActive(false);
+    }
+  }, [feedStatus]);
+
+  // Once a session actually finishes (writer already released server-side -
+  // see monitor.py's stop_session()/_finalize_session()), fetch the real
+  // annotated video for an upload flow so it can be replayed as many times
+  // as wanted without reprocessing, then open the report dialog.
+  const finalizeSession = async () => {
+    setSessionActive(false);
+    // Drop the drawing snapshot so the side panel switches from "draw a
+    // zone" back to the real recap ("Zones monitored") once finished,
+    // instead of re-offering zone drawing for a session that's already over.
+    setZoneFrame(null);
+    const resolve = pendingUploadResolve.current;
+    pendingUploadResolve.current = null;
+    if (resolve) {
+      try {
+        const res = await fetch(`${RZ_BASE}/session/video`);
+        resolve(res.ok ? URL.createObjectURL(await res.blob()) : "");
+      } catch {
+        resolve("");
+      }
+      // uploadActive itself is cleared by the feedStatus effect above, once
+      // FeedPanel actually reflects the outcome - not here.
+    }
+    setReportOpen(true);
+  };
 
   // Poll real status every second while a session is running - same cadence
   // every other module uses for its live status.
@@ -206,8 +265,7 @@ function Intrusion() {
         if (!data.is_capturing) {
           // The source reached EOF on its own (uploaded file) rather than an
           // explicit Stop click - finalize the same way a manual stop does.
-          setSessionActive(false);
-          setReportOpen(true);
+          void finalizeSession();
         }
       } catch {
         // backend unreachable, keep last known status
@@ -258,9 +316,11 @@ function Intrusion() {
 
   const handleStopMonitoring = async () => {
     if (!sessionActive) return;
-    setSessionActive(false);
+    // stop_session() on the backend joins the capture thread before
+    // responding, so the annotated video is already fully written and
+    // closed by the time this resolves - safe to fetch it right after.
     await stopZoneSession();
-    setReportOpen(true);
+    await finalizeSession();
   };
 
   const currentlyInside = status && "currently_inside" in status ? status.currently_inside : 0;
@@ -364,11 +424,25 @@ function Intrusion() {
           onStop={async () => {
             await handleStopMonitoring();
           }}
-          onProcessMedia={async (file) => {
-            await uploadZoneVideo(file);
-            const frame = await fetchZoneFrame();
-            setZoneFrame(frame);
-            return URL.createObjectURL(file);
+          onProcessMedia={(file) => {
+            setUploadActive(true);
+            return new Promise<string>((resolve) => {
+              pendingUploadResolve.current = resolve;
+              (async () => {
+                try {
+                  await uploadZoneVideo(file);
+                  const frame = await fetchZoneFrame();
+                  setZoneFrame(frame);
+                  // Resolution is deferred until the session actually
+                  // finishes (see finalizeSession) - by then the real
+                  // annotated video is ready and replayable as many times
+                  // as wanted, never a raw unprocessed preview.
+                } catch {
+                  pendingUploadResolve.current = null;
+                  resolve(URL.createObjectURL(file));
+                }
+              })();
+            });
           }}
           overlay={
             backendConnected ? undefined : (

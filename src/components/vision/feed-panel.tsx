@@ -3,6 +3,7 @@ import {
   Camera,
   CameraOff,
   CircleAlert,
+  Clapperboard,
   Loader2,
   Play,
   RefreshCw,
@@ -20,8 +21,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { Chip, type Tone } from "./kit";
+
+const API_BASE = "http://localhost:8000";
+
+type SampleVideo = { name: string; url: string };
 
 export type FeedStatus =
   "idle" | "requesting" | "connecting" | "live" | "demo" | "stopped" | "media" | "error";
@@ -113,8 +124,11 @@ export function FeedPanel({
   const [dragging, setDragging] = useState(false);
   const [clock, setClock] = useState("--:--:--");
   const [feedRetry, setFeedRetry] = useState(0);
+  const [sampleVideos, setSampleVideos] = useState<SampleVideo[]>([]);
+  const [loadingSample, setLoadingSample] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const mediaVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
@@ -135,6 +149,21 @@ export function FeedPanel({
     tick();
     const t = setInterval(tick, 1000);
     return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/sample-videos/list`)
+      .then((res) => (res.ok ? res.json() : { videos: [] }))
+      .then((data: { videos: SampleVideo[] }) => {
+        if (!cancelled) setSampleVideos(data.videos ?? []);
+      })
+      .catch(() => {
+        // No backend reachable yet - just hide the button, not fatal.
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const stopStream = useCallback(() => {
@@ -294,10 +323,28 @@ export function FeedPanel({
     toast.success("Media loaded", { description: file.name });
   };
 
+  const handleSampleVideo = async (sample: SampleVideo) => {
+    if (!(await passesGuard())) return;
+    setLoadingSample(true);
+    try {
+      const res = await fetch(`${API_BASE}${sample.url}`);
+      if (!res.ok) throw new Error("Failed to fetch sample video");
+      const blob = await res.blob();
+      const file = new File([blob], sample.name, { type: blob.type || "video/mp4" });
+      await handleFile(file);
+    } catch {
+      toast.error("Could not load sample video");
+    } finally {
+      setLoadingSample(false);
+    }
+  };
+
   const info = statusCopy[status];
-  const showLiveSrc = (status === "live" || (liveOverride && status === "media")) && !!liveSrc;
-  const showOverlay = status === "live" || status === "demo" || status === "media";
-  const isLive = status === "live" || status === "demo" || (liveOverride && status === "media");
+  const liveOverrideActive = liveOverride && (status === "media" || status === "connecting");
+  const showLiveSrc = (status === "live" || liveOverrideActive) && !!liveSrc;
+  const showOverlay =
+    status === "live" || status === "demo" || status === "media" || liveOverrideActive;
+  const isLive = status === "live" || status === "demo" || liveOverrideActive;
 
   return (
     <section className="rounded-xl bg-elev ring-1 ring-line">
@@ -337,7 +384,7 @@ export function FeedPanel({
               key={feedRetry}
               src={liveSrc}
               alt={`${cameraCode} live feed`}
-              className="absolute inset-0 size-full object-cover"
+              className="absolute inset-0 size-full bg-ink object-contain"
               onError={() => {
                 // The MJPEG connection can drop for transient reasons (network
                 // blip, tab backgrounding). The session/camera keeps running
@@ -355,6 +402,7 @@ export function FeedPanel({
           ) : status === "media" && upload ? (
             upload.kind === "video" ? (
               <video
+                ref={mediaVideoRef}
                 src={upload.url}
                 controls
                 className="absolute inset-0 size-full bg-ink object-contain"
@@ -397,7 +445,7 @@ export function FeedPanel({
           ) : null}
 
           {/* state veils */}
-          {status === "requesting" || status === "connecting" ? (
+          {(status === "requesting" || status === "connecting") && !showLiveSrc ? (
             <div className="absolute inset-0 grid place-items-center bg-ink/70 text-elev">
               <div className="flex flex-col items-center gap-2">
                 <Loader2 className="size-5 animate-spin" />
@@ -407,6 +455,13 @@ export function FeedPanel({
                     : (busyLabel ?? "Connecting camera")}
                 </p>
               </div>
+            </div>
+          ) : null}
+
+          {status === "connecting" && showLiveSrc ? (
+            <div className="absolute bottom-3 left-3 flex items-center gap-1.5 rounded-md bg-ink/70 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-elev">
+              <Loader2 className="size-3 animate-spin" />
+              {busyLabel ?? "Processing"}
             </div>
           ) : null}
 
@@ -471,6 +526,48 @@ export function FeedPanel({
           >
             <Upload className="size-3.5" /> Upload media
           </Button>
+          {sampleVideos.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button size="sm" variant="outline" disabled={loadingSample}>
+                  {loadingSample ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Clapperboard className="size-3.5" />
+                  )}
+                  Sample videos
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {sampleVideos.map((v) => (
+                  <DropdownMenuItem key={v.url} onClick={() => void handleSampleVideo(v)}>
+                    {v.name.replace(/\.[^./]+$/, "")}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+          {status === "media" && upload?.kind === "video" ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const el = mediaVideoRef.current;
+                if (!el) return;
+                el.pause();
+                el.currentTime = 0;
+                // Some browsers reject play() if it's issued in the same
+                // tick as the currentTime seek (the seek hasn't landed yet)
+                // - retry once "seeked" actually fires instead of failing
+                // silently.
+                el.play().catch(() => {
+                  el.addEventListener("seeked", () => void el.play(), { once: true });
+                });
+              }}
+            >
+              <RefreshCw className="size-3.5" /> Replay
+            </Button>
+          ) : null}
           {status === "media" && upload ? (
             <Button size="sm" variant="outline" onClick={handleDownload}>
               <Download className="size-3.5" /> Download result
