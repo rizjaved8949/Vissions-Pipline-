@@ -683,6 +683,7 @@ function Guard() {
                 : `${GUARD_BASE}/live/current/stream`
             }
             liveOverride={!!processingJobId}
+            sampleVideosModule="Guard"
             {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
             onStatusChange={setFeedStatus}
             onConnect={async () => {

@@ -415,6 +415,12 @@ function Intrusion() {
           sampleAlt="Warehouse floor camera feed with restricted zone"
           liveSrc={`${RZ_BASE}/video_feed`}
           liveOverride={sessionActive}
+          sampleVideosModule="zone"
+          {...(starting
+            ? { busyLabel: "Starting monitoring" }
+            : drawingZones
+              ? { busyLabel: "Draw a restricted zone to the right" }
+              : {})}
           onStatusChange={setFeedStatus}
           onConnect={async () => {
             await setCameraSource();

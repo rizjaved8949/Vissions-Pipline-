@@ -79,6 +79,11 @@ type FeedPanelProps = {
    *  same live feed rather than handing back one finished file (e.g. a
    *  session that keeps running after onProcessMedia resolves). */
   liveOverride?: boolean;
+  /** Restricts the "Sample videos" dropdown to clips whose filename contains
+   *  this keyword (e.g. "Guard", "Kitchen") - so one module's sample footage
+   *  never shows up on another module's page. Omit it and no sample videos
+   *  are offered at all (never falls back to showing every clip). */
+  sampleVideosModule?: string;
 };
 
 const statusCopy: Record<FeedStatus, { text: string; tone: Tone }> = {
@@ -111,6 +116,7 @@ export function FeedPanel({
   onDownload,
   busyLabel,
   liveOverride = false,
+  sampleVideosModule,
 }: FeedPanelProps) {
   const [status, setStatus] = useState<FeedStatus>("demo");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -152,8 +158,12 @@ export function FeedPanel({
   }, []);
 
   useEffect(() => {
+    if (!sampleVideosModule) {
+      setSampleVideos([]);
+      return;
+    }
     let cancelled = false;
-    fetch(`${API_BASE}/api/sample-videos/list`)
+    fetch(`${API_BASE}/api/sample-videos/list?module=${encodeURIComponent(sampleVideosModule)}`)
       .then((res) => (res.ok ? res.json() : { videos: [] }))
       .then((data: { videos: SampleVideo[] }) => {
         if (!cancelled) setSampleVideos(data.videos ?? []);
@@ -164,7 +174,7 @@ export function FeedPanel({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sampleVideosModule]);
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());

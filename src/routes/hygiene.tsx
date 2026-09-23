@@ -463,6 +463,7 @@ function Hygiene() {
             sampleAlt="Commercial kitchen camera feed"
             liveSrc={`${KITCHEN_BASE}/sessions/current/stream`}
             liveOverride={processingUpload}
+            sampleVideosModule="Kitchen"
             {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
             onStatusChange={setFeedStatus}
             onConnect={async () => {
