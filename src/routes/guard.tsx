@@ -780,13 +780,21 @@ function Guard() {
             <Kpi
               label="Duty duration"
               value={guardStats ? fmtSeconds(guardStats.dutySeconds) : "5h 42m"}
-              hint="since 09:00"
+              hint={guardStats ? (feedStatus === "live" ? "since connect" : "this video") : "since 09:00"}
             />
             <Kpi
               label="Alert time"
               value={guardStats ? fmtSeconds(guardStats.alertSeconds) : "4h 51m"}
               tone="moss"
-              hint="85% of shift"
+              hint={
+                guardStats
+                  ? `${
+                      guardStats.dutySeconds > 0
+                        ? Math.round((guardStats.alertSeconds / guardStats.dutySeconds) * 100)
+                        : 0
+                    }% of duty time`
+                  : "85% of shift"
+              }
             />
             <Kpi
               label="Inactive time"
@@ -798,20 +806,29 @@ function Guard() {
               label="Sleep events"
               value={guardStats ? guardStats.sleepEvents : 1}
               tone="rose"
-              hint="4m 12s total"
+              hint={guardStats ? `${fmtSeconds(guardStats.sleepSeconds)} total` : "4m 12s total"}
             />
             <Kpi
               label="Absences"
               value={guardStats ? guardStats.absenceEvents : 1}
               tone="rose"
-              hint="12m 04s total"
+              hint={guardStats ? `${fmtSeconds(guardStats.absenceSeconds)} total` : "12m 04s total"}
             />
           </div>
         </div>
 
         <div className="space-y-4">
           <Panel className="overflow-hidden">
-            <PanelHead title="Duty timeline" hint="Shift started 09:00" />
+            <PanelHead
+              title="Duty timeline"
+              hint={
+                backendConnected
+                  ? feedStatus === "live"
+                    ? "Since connect"
+                    : "This video"
+                  : "Shift started 09:00"
+              }
+            />
             <ol className="space-y-0 px-4 py-2">
               {timelineEntries.map((t) => {
                 const m = stateMeta[t.state];
@@ -854,7 +871,16 @@ function Guard() {
           </Panel>
 
           <Panel className="overflow-hidden">
-            <PanelHead title="Alert history" hint="This shift">
+            <PanelHead
+              title="Alert history"
+              hint={
+                backendConnected
+                  ? feedStatus === "live"
+                    ? "Since connect"
+                    : "This video"
+                  : "This shift"
+              }
+            >
               <Select value={eventSeverity} onValueChange={setEventSeverity}>
                 <SelectTrigger className="w-[160px]">
                   <SelectValue placeholder="Filter" />
