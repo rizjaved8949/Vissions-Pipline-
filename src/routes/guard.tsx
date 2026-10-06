@@ -137,6 +137,14 @@ async function stopGuardLiveSession(sessionId: string) {
   }
 }
 
+async function stopGuardJob(jobId: string) {
+  try {
+    await fetch(`${GUARD_BASE}/jobs/${jobId}/stop`, { method: "POST" });
+  } catch {
+    // Backend unreachable - nothing more we can do client-side.
+  }
+}
+
 async function fetchLiveState(sessionId: string): Promise<LiveState> {
   const res = await fetch(`${GUARD_BASE}/live/${sessionId}/state`);
   return jsonOrThrow(res, "Failed to fetch live state");
@@ -692,9 +700,24 @@ function Guard() {
               setReportSessionId(session_id);
             }}
             onStop={async () => {
-              const id = sessionId;
+              const camId = sessionId;
               setSessionId(null);
-              if (id) await stopGuardLiveSession(id);
+              if (camId) {
+                await stopGuardLiveSession(camId);
+                return;
+              }
+              // An upload still processing (FeedPanel shows "Stop session"
+              // during "connecting" too) - without this, the backend job
+              // never actually stopped and kept running to the end
+              // regardless of the click, only to pop up as a finished video
+              // later. Signal it to stop now; the pending onProcessMedia
+              // promise (already polling job status) picks up the
+              // "completed" transition within a second or two and resolves
+              // with the now-early-finished real video, same as letting it
+              // reach EOF on its own.
+              if (processingJobId) {
+                await stopGuardJob(processingJobId);
+              }
             }}
             onProcessMedia={async (file) => {
               setUploadLabel("Uploading video");
@@ -780,7 +803,13 @@ function Guard() {
             <Kpi
               label="Duty duration"
               value={guardStats ? fmtSeconds(guardStats.dutySeconds) : "5h 42m"}
-              hint={guardStats ? (feedStatus === "live" ? "since connect" : "this video") : "since 09:00"}
+              hint={
+                guardStats
+                  ? feedStatus === "live"
+                    ? "since connect"
+                    : "this video"
+                  : "since 09:00"
+              }
             />
             <Kpi
               label="Alert time"

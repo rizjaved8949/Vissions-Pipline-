@@ -266,6 +266,10 @@ function Hygiene() {
   const [violationsLog, setViolationsLog] = useState<KitchenViolation[]>([]);
   const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
   const [processingUpload, setProcessingUpload] = useState(false);
+  // The session id for an upload still processing - sessionId itself isn't
+  // set until onProcessMedia resolves (after processing finishes), so Stop
+  // needs this separate id to actually reach the backend mid-processing.
+  const [processingSessionId, setProcessingSessionId] = useState<string | null>(null);
 
   // True the moment a real camera/upload is in play, including while an
   // upload is still processing - not just once results are ready. Keeps the
@@ -326,6 +330,7 @@ function Hygiene() {
   useEffect(() => {
     if (feedStatus !== "connecting" && feedStatus !== "requesting") {
       setProcessingUpload(false);
+      setProcessingSessionId(null);
     }
   }, [feedStatus]);
 
@@ -472,12 +477,25 @@ function Hygiene() {
               setReportSessionId(session_id);
             }}
             onStop={async () => {
-              const id = sessionId;
+              const camId = sessionId;
               setSessionId(null);
-              if (id) {
-                await stopKitchenSession(id);
-                setReportSessionId(id);
+              if (camId) {
+                await stopKitchenSession(camId);
+                setReportSessionId(camId);
                 setSessionReportOpen(true);
+                return;
+              }
+              // An upload still processing (FeedPanel shows "Stop session"
+              // during "connecting" too) - without this, the backend session
+              // never actually stopped and kept running to the end
+              // regardless of the click, only to pop up as a finished video
+              // later. Signal it to stop now; the pending onProcessMedia
+              // promise (already polling session status) picks up the
+              // "completed"/"stopped" transition within a second or two and
+              // resolves with the now-early-finished real video, same as
+              // letting it reach EOF on its own.
+              if (processingSessionId) {
+                await stopKitchenSession(processingSessionId);
               }
             }}
             onProcessMedia={async (file) => {
@@ -485,6 +503,7 @@ function Hygiene() {
               setProcessingUpload(true);
               try {
                 const newSessionId = await createKitchenUpload(file);
+                setProcessingSessionId(newSessionId);
                 const status = await waitForKitchenSession(newSessionId, (s) =>
                   setUploadLabel(uploadProgressLabel(s)),
                 );

@@ -55,16 +55,6 @@ type PlateRecordReal = {
   raw_image_url: string | null;
 };
 
-type JobSummary = {
-  frames: number;
-  elapsed_s: number;
-  fps: number;
-  finalized: number;
-  lowconf: number;
-  video: string | null;
-  counts: { plates_saved: number; lowconf_quarantined: number; rejected_adframe: number };
-};
-
 type JobStatusResponse = {
   job_id: string;
   status: "queued" | "processing" | "completed" | "failed";
@@ -142,12 +132,6 @@ async function waitForPlateJob(
     if (status.status === "completed" || status.status === "failed") return status;
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
-}
-
-async function fetchJobSummary(jobId: string): Promise<JobSummary> {
-  const res = await fetch(`${ALPR_BASE}/jobs/${jobId}/summary`);
-  const data = await jsonOrThrow<{ summary: JobSummary }>(res, "Failed to fetch job summary");
-  return data.summary;
 }
 
 async function fetchPlates(jobId: string): Promise<PlateRecordReal[]> {
@@ -229,7 +213,6 @@ function Plates() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [reportJobId, setReportJobId] = useState<string | null>(null);
   const [sessionReportOpen, setSessionReportOpen] = useState(false);
-  const [jobSummary, setJobSummary] = useState<JobSummary | null>(null);
   const [plates, setPlates] = useState<PlateRecordReal[]>([]);
   const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
   const [processingJobId, setProcessingJobId] = useState<string | null>(null);
@@ -244,7 +227,6 @@ function Plates() {
   useEffect(() => {
     if (feedStatus !== "media" && feedStatus !== "live") {
       setJobId(null);
-      setJobSummary(null);
       setPlates([]);
     }
   }, [feedStatus]);
@@ -261,6 +243,32 @@ function Plates() {
   }, [feedStatus]);
 
   const activeStreamJobId = sessionId || processingJobId;
+
+  // Poll live plates every second while a camera/job is actively running -
+  // results.csv is updated in real time as each vehicle track finalizes
+  // (see ResultWorker._process in alpr/pipeline.py), so the KPIs/chart below
+  // reflect progress as it happens instead of only once the whole
+  // video/session is done. Stops naturally once processing ends
+  // (activeStreamJobId goes back to null) - the final authoritative read
+  // still happens in onConnect's onStop / onProcessMedia's own fetch.
+  useEffect(() => {
+    if (!activeStreamJobId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await fetchPlates(activeStreamJobId);
+        if (!cancelled) setPlates(data);
+      } catch {
+        // backend unreachable, keep last known plates
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [activeStreamJobId]);
 
   const vehicleCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -357,22 +365,30 @@ function Plates() {
             setReportJobId(job_id);
           }}
           onStop={async () => {
-            const id = sessionId;
+            const camId = sessionId;
             setSessionId(null);
-            if (id) {
-              await stopPlateJob(id);
-              setReportJobId(id);
+            if (camId) {
+              await stopPlateJob(camId);
+              setReportJobId(camId);
               setSessionReportOpen(true);
               try {
-                const [summaryData, platesData] = await Promise.all([
-                  fetchJobSummary(id),
-                  fetchPlates(id),
-                ]);
-                setJobSummary(summaryData);
-                setPlates(platesData);
+                setPlates(await fetchPlates(camId));
               } catch {
                 // backend unreachable - the report dialog still works on demand
               }
+              return;
+            }
+            // An upload still processing (FeedPanel shows "Stop session" during
+            // "connecting" too) - without this, the backend job never actually
+            // stopped and kept running to the end regardless of the click, only
+            // to pop up as a finished video later. Signal it to stop now; the
+            // pending onProcessMedia promise (already polling job status) picks
+            // up the "completed" transition within a second or two and resolves
+            // with the now-early-finished real video, same as letting it reach
+            // EOF on its own.
+            if (processingJobId) {
+              setUploadLabel("Stopping…");
+              await stopPlateJob(processingJobId);
             }
           }}
           onProcessMedia={async (file) => {
@@ -387,14 +403,12 @@ function Plates() {
                 throw new Error(status.error || "ALPR processing failed");
               }
               setUploadLabel("Loading processed video");
-              const [url, summaryData, platesData] = await Promise.all([
+              const [url, platesData] = await Promise.all([
                 fetchJobVideoUrl(newJobId),
-                fetchJobSummary(newJobId),
                 fetchPlates(newJobId),
               ]);
               setJobId(newJobId);
               setReportJobId(newJobId);
-              setJobSummary(summaryData);
               setPlates(platesData);
               return url;
             } finally {
@@ -492,7 +506,7 @@ function Plates() {
           <div className="grid grid-cols-2 gap-3">
             <Kpi
               label="Vehicles tracked"
-              value={backendConnected ? (jobSummary?.finalized ?? 0) : 149}
+              value={backendConnected ? plates.length : 149}
               hint={backendConnected ? "this video" : "both lanes"}
             />
             <Kpi
@@ -513,9 +527,7 @@ function Plates() {
             />
             <Kpi
               label="Needs review"
-              value={
-                backendConnected ? (jobSummary?.counts.lowconf_quarantined ?? 0) : uniqueDemo + 121
-              }
+              value={backendConnected ? plates.filter((p) => p.low_conf).length : uniqueDemo + 121}
               tone={backendConnected ? "rose" : "moss"}
               hint={backendConnected ? "low confidence" : "12 repeat visitors"}
             />

@@ -175,7 +175,6 @@ function Intrusion() {
   const [sessionActive, setSessionActive] = useState(false);
   const [starting, setStarting] = useState(false);
   const [status, setStatus] = useState<RZStatus | null>(null);
-  const [reportOpen, setReportOpen] = useState(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
   // True from the moment an upload starts until its replay video is ready -
@@ -230,7 +229,8 @@ function Intrusion() {
   // Once a session actually finishes (writer already released server-side -
   // see monitor.py's stop_session()/_finalize_session()), fetch the real
   // annotated video for an upload flow so it can be replayed as many times
-  // as wanted without reprocessing, then open the report dialog.
+  // as wanted without reprocessing. The report itself is downloaded on
+  // demand from the "Download report" button, not forced on the user here.
   const finalizeSession = async () => {
     setSessionActive(false);
     // Drop the drawing snapshot so the side panel switches from "draw a
@@ -249,7 +249,6 @@ function Intrusion() {
       // uploadActive itself is cleared by the feedStatus effect above, once
       // FeedPanel actually reflects the outcome - not here.
     }
-    setReportOpen(true);
   };
 
   // Poll real status every second while a session is running - same cadence
@@ -423,6 +422,11 @@ function Intrusion() {
               : {})}
           onStatusChange={setFeedStatus}
           onConnect={async () => {
+            // A previous session's report may still be sitting unreported
+            // (the user never clicked "Download report") - clear it before
+            // starting a fresh one so its video/snapshots don't orphan on
+            // disk indefinitely.
+            await wipeZoneData();
             await setCameraSource();
             const frame = await fetchZoneFrame();
             setZoneFrame(frame);
@@ -436,6 +440,7 @@ function Intrusion() {
               pendingUploadResolve.current = resolve;
               (async () => {
                 try {
+                  await wipeZoneData();
                   await uploadZoneVideo(file);
                   const frame = await fetchZoneFrame();
                   setZoneFrame(frame);
@@ -655,25 +660,6 @@ function Intrusion() {
               )}
             </Panel>
           )}
-
-          {/* Fully dialog-controlled (no visible trigger) - opened
-              programmatically right after Stop or auto-finish, same pattern
-              Attendance/Guard/Kitchen use. */}
-          <DownloadDialog
-            reportName="Session report"
-            trigger={null}
-            open={reportOpen}
-            onOpenChange={setReportOpen}
-            onCancel={() => void wipeZoneData()}
-            {...(backendConnected
-              ? {
-                  onGenerate: async (format: ReportFormat) => {
-                    const { blob, name } = await fetchZoneReport(format);
-                    downloadBlob(blob, name);
-                  },
-                }
-              : {})}
-          />
 
           {sessionActive ? (
             <Button
