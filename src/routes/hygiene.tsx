@@ -32,6 +32,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { complianceTrend, kitchenStaff, violations } from "@/lib/mock";
+import {
+  asLiveEntry,
+  asUploadEntry,
+  clearModuleSession,
+  getModuleEntry,
+  initialFeedStatus,
+  restoreFeedProps,
+  runUpload,
+  setLiveSession,
+  useRestoredSession,
+} from "@/lib/session-store";
 import feedKitchen from "@/assets/feed-kitchen.jpg";
 
 /* ---------------- backend wiring ---------------- */
@@ -144,6 +155,15 @@ async function stopKitchenSession(sessionId: string) {
   }
 }
 
+/** Whether a session remembered from before the last navigation is still
+ *  running on the backend, so the page knows to re-attach to it. */
+async function kitchenSessionIsRunning(sessionId: string): Promise<boolean> {
+  const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}`);
+  if (!res.ok) return false;
+  const data: { status?: string } = await res.json();
+  return data.status === "running" || data.status === "queued";
+}
+
 async function fetchKitchenStatus(sessionId: string): Promise<KitchenSessionStatus> {
   const res = await fetch(`${KITCHEN_BASE}/sessions/${sessionId}`);
   return jsonOrThrow(res, "Failed to fetch session status");
@@ -228,6 +248,40 @@ function violationLabel(type: string): string {
   return VIOLATION_LABELS[type] ?? type.replace(/_/g, " ");
 }
 
+/** Everything the page needs to render a finished upload, kept in the session
+ *  store so it survives the page being navigated away from. */
+type KitchenUploadData = {
+  sessionId: string;
+  dashboard: KitchenDashboard;
+  violationsLog: KitchenViolation[];
+};
+
+/** Drives an upload to completion outside any component's lifetime, so
+ *  processing continues - and keeps reporting progress - while the user is on
+ *  another module's page. */
+function startKitchenUpload(file: File) {
+  return runUpload<KitchenUploadData>("hygiene", file, async (report) => {
+    report({ label: "Uploading video" });
+    const sessionId = await createKitchenUpload(file);
+    report({ sessionId, label: "Processing video" });
+
+    const status = await waitForKitchenSession(sessionId, (s) =>
+      report({ label: uploadProgressLabel(s) }),
+    );
+    if (status.status === "failed") {
+      throw new Error(status.error || "Kitchen processing failed");
+    }
+
+    report({ phase: "loading", label: "Loading processed video" });
+    const [url, dashboard, violationsLog] = await Promise.all([
+      fetchKitchenVideoUrl(sessionId),
+      fetchKitchenDashboard(sessionId),
+      fetchKitchenViolations(sessionId),
+    ]);
+    return { url, data: { sessionId, dashboard, violationsLog } };
+  });
+}
+
 /* ---------------- component ---------------- */
 
 export const Route = createFileRoute("/hygiene")({
@@ -257,19 +311,50 @@ const categories = [
 ];
 
 function Hygiene() {
-  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  // Seeded from the store, not hardcoded to "demo": the wipe effects below key
+  // off feedStatus, so starting at "demo" would erase a restored result on the
+  // very first render.
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>(() =>
+    initialFeedStatus(getModuleEntry("hygiene")),
+  );
+
+  // A camera session or an upload started before the user navigated away is
+  // still running on the backend; pick it back up instead of the demo feed.
+  const { ready: sessionReady, restored } = useRestoredSession("hygiene", kitchenSessionIsRunning);
+  const liveEntry = asLiveEntry(restored);
+  const uploadEntry = asUploadEntry<KitchenUploadData>(restored);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reportSessionId, setReportSessionId] = useState<string | null>(null);
   const [sessionReportOpen, setSessionReportOpen] = useState(false);
   const [dashboard, setDashboard] = useState<KitchenDashboard | null>(null);
   const [violationsLog, setViolationsLog] = useState<KitchenViolation[]>([]);
-  const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
-  const [processingUpload, setProcessingUpload] = useState(false);
-  // The session id for an upload still processing - sessionId itself isn't
-  // set until onProcessMedia resolves (after processing finishes), so Stop
-  // needs this separate id to actually reach the backend mid-processing.
-  const [processingSessionId, setProcessingSessionId] = useState<string | null>(null);
+
+  // Upload progress lives in the store so it keeps advancing while this page is
+  // unmounted, which is exactly what makes it survive a page change.
+  // processingSessionId is what lets Stop reach the backend mid-processing,
+  // since sessionId isn't set until processing has finished.
+  const uploadLabel = uploadEntry?.label;
+  const processingUpload = uploadEntry?.phase === "processing" || uploadEntry?.phase === "loading";
+  const processingSessionId = processingUpload ? (uploadEntry?.sessionId ?? null) : null;
+
+  // Adopt the restored session's id once it has been confirmed still running,
+  // so the polling effects below treat it exactly like a freshly started one.
+  useEffect(() => {
+    if (!sessionReady || !liveEntry) return;
+    setSessionId(liveEntry.sessionId);
+    setReportSessionId(liveEntry.sessionId);
+  }, [sessionReady, liveEntry]);
+
+  // Re-seed the result panels from an upload that finished (possibly while the
+  // user was on another page).
+  useEffect(() => {
+    if (uploadEntry?.phase !== "done" || !uploadEntry.data) return;
+    setSessionId(uploadEntry.data.sessionId);
+    setReportSessionId(uploadEntry.data.sessionId);
+    setDashboard(uploadEntry.data.dashboard);
+    setViolationsLog(uploadEntry.data.violationsLog);
+  }, [uploadEntry]);
 
   // True the moment a real camera/upload is in play, including while an
   // upload is still processing - not just once results are ready. Keeps the
@@ -313,26 +398,17 @@ function Hygiene() {
   }, [feedStatus, sessionId]);
 
   // A stale processed session's dashboard shouldn't linger once the user
-  // leaves "media".
+  // leaves "media" - but never clear a result the store is still holding, or
+  // returning to this page would wipe the finished upload it is there to
+  // restore.
+  const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
+    if (hasStoredResult) return;
     if (feedStatus !== "media" && feedStatus !== "live") {
       setDashboard(null);
       setViolationsLog([]);
     }
-  }, [feedStatus]);
-
-  // Only turn processingUpload off once feedStatus itself has actually left
-  // "connecting" - never on a timer or from inside onProcessMedia's own
-  // finally block, which would create a gap where processingUpload is
-  // already false but feedStatus hasn't caught up yet, making
-  // backendConnected flicker back to false (and panels flash demo data)
-  // right as the real result is ready.
-  useEffect(() => {
-    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
-      setProcessingUpload(false);
-      setProcessingSessionId(null);
-    }
-  }, [feedStatus]);
+  }, [feedStatus, hasStoredResult]);
 
   const [severity, setSeverity] = useState("all");
   const [complianceFilter, setComplianceFilter] = useState("all");
@@ -462,6 +538,8 @@ function Hygiene() {
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="space-y-4">
           <FeedPanel
+            key={sessionReady ? "ready" : "restoring"}
+            {...restoreFeedProps("hygiene", sessionReady, restored)}
             title="Kitchen line monitoring"
             cameraCode="CAM-03"
             sample={feedKitchen}
@@ -475,10 +553,12 @@ function Hygiene() {
               const { session_id } = await startKitchenCamera();
               setSessionId(session_id);
               setReportSessionId(session_id);
+              setLiveSession("hygiene", session_id);
             }}
             onStop={async () => {
               const camId = sessionId;
               setSessionId(null);
+              clearModuleSession("hygiene");
               if (camId) {
                 await stopKitchenSession(camId);
                 setReportSessionId(camId);
@@ -498,36 +578,7 @@ function Hygiene() {
                 await stopKitchenSession(processingSessionId);
               }
             }}
-            onProcessMedia={async (file) => {
-              setUploadLabel("Uploading video");
-              setProcessingUpload(true);
-              try {
-                const newSessionId = await createKitchenUpload(file);
-                setProcessingSessionId(newSessionId);
-                const status = await waitForKitchenSession(newSessionId, (s) =>
-                  setUploadLabel(uploadProgressLabel(s)),
-                );
-                if (status.status === "failed") {
-                  throw new Error(status.error || "Kitchen processing failed");
-                }
-                setUploadLabel("Loading processed video");
-                const [url, dashboardData, log] = await Promise.all([
-                  fetchKitchenVideoUrl(newSessionId),
-                  fetchKitchenDashboard(newSessionId),
-                  fetchKitchenViolations(newSessionId),
-                ]);
-                setSessionId(newSessionId);
-                setReportSessionId(newSessionId);
-                setDashboard(dashboardData);
-                setViolationsLog(log);
-                return url;
-              } finally {
-                // processingUpload itself is cleared by the feedStatus
-                // effect above, once FeedPanel actually reflects the
-                // outcome - not here.
-                setUploadLabel(undefined);
-              }
-            }}
+            onProcessMedia={startKitchenUpload}
             overlay={
               feedStatus === "live" || feedStatus === "media" || processingUpload ? undefined : (
                 <>

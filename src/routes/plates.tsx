@@ -33,6 +33,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { plateRecords, plateTraffic, type PlateRecord } from "@/lib/mock";
+import {
+  asLiveEntry,
+  asUploadEntry,
+  clearModuleSession,
+  getModuleEntry,
+  initialFeedStatus,
+  restoreFeedProps,
+  runUpload,
+  setLiveSession,
+  useRestoredSession,
+} from "@/lib/session-store";
 import feedGate from "@/assets/feed-gate.jpg";
 
 /* ---------------- backend wiring ----------------
@@ -109,6 +120,15 @@ async function stopPlateJob(jobId: string) {
   }
 }
 
+/** Whether a camera job remembered from before the last navigation is still
+ *  running on the backend, so the page knows to re-attach to it. */
+async function plateJobIsRunning(jobId: string): Promise<boolean> {
+  const res = await fetch(`${ALPR_BASE}/jobs/${jobId}`);
+  if (!res.ok) return false;
+  const data: { status?: string } = await res.json();
+  return data.status === "processing" || data.status === "queued";
+}
+
 async function createPlateJob(file: File): Promise<string> {
   const body = new FormData();
   body.append("video", file);
@@ -163,6 +183,33 @@ function jobProgressLabel(status: JobStatusResponse): string {
   return "Processing video";
 }
 
+/** Everything the page needs to render a finished upload, kept in the session
+ *  store so it survives the page being navigated away from. */
+type PlateUploadData = {
+  jobId: string;
+  plates: PlateRecordReal[];
+};
+
+/** Drives an upload to completion outside any component's lifetime, so
+ *  processing continues - and keeps reporting progress - while the user is on
+ *  another module's page. */
+function startPlateUpload(file: File) {
+  return runUpload<PlateUploadData>("plates", file, async (report) => {
+    report({ label: "Uploading video" });
+    const jobId = await createPlateJob(file);
+    report({ sessionId: jobId, label: "Processing video" });
+
+    const status = await waitForPlateJob(jobId, (s) => report({ label: jobProgressLabel(s) }));
+    if (status.status === "failed") {
+      throw new Error(status.error || "ALPR processing failed");
+    }
+
+    report({ phase: "loading", label: "Loading processed video" });
+    const [url, plates] = await Promise.all([fetchJobVideoUrl(jobId), fetchPlates(jobId)]);
+    return { url, data: { jobId, plates } };
+  });
+}
+
 function vehicleIcon(vehicle: string | null) {
   if (vehicle === "motorcycle" || vehicle === "bicycle") return Bike;
   if (vehicle === "bus" || vehicle === "truck") return Truck;
@@ -207,15 +254,47 @@ function Plates() {
   const [type, setType] = useState("all");
   const [detail, setDetail] = useState<PlateRecordReal | PlateRecord | null>(null);
 
-  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  // Seeded from the store, not hardcoded to "demo": the wipe effect below keys
+  // off feedStatus, so starting at "demo" would erase a restored result on the
+  // very first render.
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>(() =>
+    initialFeedStatus(getModuleEntry("plates")),
+  );
+
+  // A camera job or an upload started before the user navigated away is still
+  // running on the backend; pick it back up instead of restarting at the demo feed.
+  const { ready: sessionReady, restored } = useRestoredSession("plates", plateJobIsRunning);
+  const liveEntry = asLiveEntry(restored);
+  const uploadEntry = asUploadEntry<PlateUploadData>(restored);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [reportJobId, setReportJobId] = useState<string | null>(null);
   const [sessionReportOpen, setSessionReportOpen] = useState(false);
   const [plates, setPlates] = useState<PlateRecordReal[]>([]);
-  const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
-  const [processingJobId, setProcessingJobId] = useState<string | null>(null);
+
+  // Upload progress lives in the store so it keeps advancing while this page is
+  // unmounted, which is exactly what makes it survive a page change.
+  const uploadRunning = uploadEntry?.phase === "processing" || uploadEntry?.phase === "loading";
+  const uploadLabel = uploadEntry?.label;
+  const processingJobId = uploadRunning ? (uploadEntry?.sessionId ?? null) : null;
+
+  // Adopt the restored job's id once it has been confirmed still running, so
+  // the polling effects below treat it exactly like a freshly started one.
+  useEffect(() => {
+    if (!sessionReady || !liveEntry) return;
+    setSessionId(liveEntry.sessionId);
+    setReportJobId(liveEntry.sessionId);
+  }, [sessionReady, liveEntry]);
+
+  // Re-seed the result panels from an upload that finished (possibly while the
+  // user was on another page).
+  useEffect(() => {
+    if (uploadEntry?.phase !== "done" || !uploadEntry.data) return;
+    setJobId(uploadEntry.data.jobId);
+    setReportJobId(uploadEntry.data.jobId);
+    setPlates(uploadEntry.data.plates);
+  }, [uploadEntry]);
 
   // True the moment a real camera/job is in play, including while an upload
   // is still processing - not just once results are ready. Keeps every real
@@ -223,24 +302,17 @@ function Plates() {
   // mock mid-processing.
   const backendConnected = feedStatus === "live" || feedStatus === "media" || !!processingJobId;
 
-  // A stale processed job shouldn't linger once the user leaves "media"/"live".
+  // A stale processed job shouldn't linger once the user leaves "media"/"live"
+  // - but never clear a result the store is still holding, or returning to this
+  // page would wipe the finished upload it is there to restore.
+  const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
+    if (hasStoredResult) return;
     if (feedStatus !== "media" && feedStatus !== "live") {
       setJobId(null);
       setPlates([]);
     }
-  }, [feedStatus]);
-
-  // Only turn processingJobId off once feedStatus itself has actually left
-  // "connecting" - never from inside onProcessMedia's own finally block,
-  // which would create a gap where processingJobId is already null but
-  // feedStatus hasn't caught up yet, making backendConnected flicker back to
-  // false (and panels flash demo data) right as the real result is ready.
-  useEffect(() => {
-    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
-      setProcessingJobId(null);
-    }
-  }, [feedStatus]);
+  }, [feedStatus, hasStoredResult]);
 
   const activeStreamJobId = sessionId || processingJobId;
 
@@ -348,6 +420,8 @@ function Plates() {
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
         <FeedPanel
+          key={sessionReady ? "ready" : "restoring"}
+          {...restoreFeedProps("plates", sessionReady, restored)}
           title="Gate approach camera"
           cameraCode="CAM-04"
           sample={feedGate}
@@ -363,10 +437,12 @@ function Plates() {
             const { job_id } = await startPlateCamera();
             setSessionId(job_id);
             setReportJobId(job_id);
+            setLiveSession("plates", job_id);
           }}
           onStop={async () => {
             const camId = sessionId;
             setSessionId(null);
+            clearModuleSession("plates");
             if (camId) {
               await stopPlateJob(camId);
               setReportJobId(camId);
@@ -387,34 +463,10 @@ function Plates() {
             // with the now-early-finished real video, same as letting it reach
             // EOF on its own.
             if (processingJobId) {
-              setUploadLabel("Stopping…");
               await stopPlateJob(processingJobId);
             }
           }}
-          onProcessMedia={async (file) => {
-            setUploadLabel("Uploading video");
-            try {
-              const newJobId = await createPlateJob(file);
-              setProcessingJobId(newJobId);
-              const status = await waitForPlateJob(newJobId, (s) =>
-                setUploadLabel(jobProgressLabel(s)),
-              );
-              if (status.status === "failed") {
-                throw new Error(status.error || "ALPR processing failed");
-              }
-              setUploadLabel("Loading processed video");
-              const [url, platesData] = await Promise.all([
-                fetchJobVideoUrl(newJobId),
-                fetchPlates(newJobId),
-              ]);
-              setJobId(newJobId);
-              setReportJobId(newJobId);
-              setPlates(platesData);
-              return url;
-            } finally {
-              setUploadLabel(undefined);
-            }
-          }}
+          onProcessMedia={startPlateUpload}
           overlay={
             backendConnected ? undefined : (
               <>

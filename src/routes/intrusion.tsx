@@ -23,6 +23,17 @@ import {
 } from "@/components/ui/select";
 import { intrusionEvents, zoneCameras } from "@/lib/mock";
 import { cn } from "@/lib/utils";
+import {
+  asLiveEntry,
+  asUploadEntry,
+  clearModuleSession,
+  getModuleEntry,
+  initialFeedStatus,
+  restoreFeedProps,
+  runUpload,
+  setLiveSession,
+  useRestoredSession,
+} from "@/lib/session-store";
 import feedWarehouse from "@/assets/feed-warehouse.jpg";
 
 /* ---------------- backend wiring ---------------- */
@@ -120,6 +131,85 @@ async function stopZoneSession() {
   }
 }
 
+/** Whether monitoring remembered from before the last navigation is still
+ *  capturing on the backend, so the page knows to re-attach to it. Restricted
+ *  Zone runs a single global session rather than one per id, so the remembered
+ *  id is only a marker - /status is the real answer. */
+async function zoneSessionIsRunning(): Promise<boolean> {
+  const res = await fetch(`${RZ_BASE}/status`);
+  if (!res.ok) return false;
+  const data: { is_capturing?: boolean } = await res.json();
+  return data.is_capturing === true;
+}
+
+/** Everything the page needs to render a finished upload, kept in the session
+ *  store so it survives the page being navigated away from. The zone frame is
+ *  published mid-flight, since the user needs it to draw zones on. */
+type ZoneUploadData = {
+  zoneFrame?: ZoneFrame;
+  status?: RZStatus;
+};
+
+const CANCELLED = "intrusion-upload-superseded";
+
+/** Polls /status until capturing matches `want`, or until this upload has been
+ *  superseded. Needed because monitoring here doesn't start when the upload
+ *  finishes - it starts when the user has drawn zones and pressed Start, which
+ *  may be after they have wandered to another page and back. */
+async function waitForZoneCapturing(
+  want: boolean,
+  report: (patch: { label?: string }) => boolean,
+  onStatus?: (status: RZStatus) => void,
+): Promise<RZStatus | undefined> {
+  for (;;) {
+    if (!report({})) throw new Error(CANCELLED);
+    let status: RZStatus | undefined;
+    try {
+      status = await fetchZoneStatus();
+    } catch {
+      // Backend unreachable - keep waiting rather than failing the upload.
+    }
+    if (status) {
+      onStatus?.(status);
+      if (status.is_capturing === want) return status;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+/** Drives an upload through zone drawing and monitoring outside any
+ *  component's lifetime, so processing continues - and keeps reporting
+ *  progress - while the user is on another module's page. */
+function startZoneUpload(file: File) {
+  return runUpload<ZoneUploadData>("intrusion", file, async (report) => {
+    report({ label: "Uploading video" });
+    await wipeZoneData();
+    await uploadZoneVideo(file);
+
+    const zoneFrame = await fetchZoneFrame();
+    report({ label: "Draw a restricted zone to the right", data: { zoneFrame } });
+
+    // The user draws zones and presses "Start monitoring" at their own pace.
+    await waitForZoneCapturing(true, report);
+    report({ label: "Monitoring" });
+
+    // Then it runs until the clip ends or the user stops it.
+    let last: RZStatus | undefined;
+    await waitForZoneCapturing(false, report, (s) => {
+      last = s;
+      const frames = "frame_count" in s ? s.frame_count : 0;
+      report({ label: `Monitoring · ${frames} frames` });
+    });
+    report({ phase: "loading", label: "Loading processed video" });
+
+    // stop_session()/_finalize_session() on the backend releases the writer
+    // before responding, so the annotated video is complete by now.
+    const res = await fetch(`${RZ_BASE}/session/video`);
+    const url = res.ok ? URL.createObjectURL(await res.blob()) : "";
+    return { url, data: { zoneFrame, ...(last ? { status: last } : {}) } };
+  });
+}
+
 async function fetchZoneStatus(): Promise<RZStatus> {
   const res = await fetch(`${RZ_BASE}/status`);
   return jsonOrThrow(res, "Failed to fetch status");
@@ -167,7 +257,12 @@ export const Route = createFileRoute("/intrusion")({
 function Intrusion() {
   const [breach, setBreach] = useState(false);
 
-  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  // Seeded from the store, not hardcoded to "demo": the reset effect below keys
+  // off feedStatus, so starting at "demo" would erase a restored result on the
+  // very first render.
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>(() =>
+    initialFeedStatus(getModuleEntry("intrusion")),
+  );
 
   const [zoneFrame, setZoneFrame] = useState<ZoneFrame | null>(null);
   const [savedZones, setSavedZones] = useState<DrawnZone[]>([]);
@@ -177,15 +272,39 @@ function Intrusion() {
   const [status, setStatus] = useState<RZStatus | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
+  // Monitoring or an upload started before the user navigated away is still
+  // running on the backend; pick it back up instead of restarting at the demo
+  // feed. Zone outlines don't need restoring - the backend draws them into the
+  // stream.
+  const { ready: sessionReady, restored } = useRestoredSession("intrusion", zoneSessionIsRunning);
+  const liveEntry = asLiveEntry(restored);
+  const uploadEntry = asUploadEntry<ZoneUploadData>(restored);
+
+  useEffect(() => {
+    if (!sessionReady || !liveEntry) return;
+    setSessionActive(true);
+  }, [sessionReady, liveEntry]);
+
   // True from the moment an upload starts until its replay video is ready -
   // keeps every real panel/KPI showing real (if empty) data through zone
   // drawing and monitoring, instead of falling back to demo mock data while
-  // FeedPanel itself is still sitting in "connecting".
-  const [uploadActive, setUploadActive] = useState(false);
-  // Holds the pending onProcessMedia resolver for an upload flow, fulfilled
-  // only once the session actually finishes and a replayable video exists -
-  // never while it's still being processed.
-  const pendingUploadResolve = useRef<((url: string) => void) | null>(null);
+  // FeedPanel itself is still sitting in "connecting". Driven by the store, so
+  // it is still true after a page change.
+  const uploadActive = uploadEntry?.phase === "processing" || uploadEntry?.phase === "loading";
+  const uploadLabel = uploadEntry?.label;
+  const hasStoredResult = uploadEntry?.phase === "done";
+
+  // Pick the zone-drawing snapshot and the finished recap back up from the
+  // store, so an upload mid-flow doesn't lose the frame it is drawn on.
+  useEffect(() => {
+    const storedFrame = uploadEntry?.data?.zoneFrame;
+    if (storedFrame && !sessionActive) setZoneFrame(storedFrame);
+  }, [uploadEntry, sessionActive]);
+
+  useEffect(() => {
+    const storedStatus = uploadEntry?.phase === "done" ? uploadEntry.data?.status : undefined;
+    if (storedStatus) setStatus(storedStatus);
+  }, [uploadEntry]);
 
   const backendConnected = feedStatus === "live" || feedStatus === "media" || uploadActive;
   const drawingZones = backendConnected && zoneFrame && !sessionActive;
@@ -196,15 +315,15 @@ function Intrusion() {
     setCurrentPoints([]);
     setSessionActive(false);
     setStatus(null);
-    setUploadActive(false);
-    pendingUploadResolve.current = null;
   };
 
   // Reset on a genuine disconnect only - not merely because uploadActive
   // hasn't caught up with feedStatus yet (there's a brief gap between the
   // upload's promise resolving and FeedPanel's status actually flipping to
-  // "media" that must not be mistaken for a disconnect mid-transition).
+  // "media" that must not be mistaken for a disconnect mid-transition), and
+  // never while the store is holding a finished result to restore.
   useEffect(() => {
+    if (hasStoredResult) return;
     if (
       feedStatus === "idle" ||
       feedStatus === "demo" ||
@@ -213,42 +332,16 @@ function Intrusion() {
     ) {
       resetZoneState();
     }
-  }, [feedStatus]);
+  }, [feedStatus, hasStoredResult]);
 
-  // Only turn uploadActive off once feedStatus itself has actually left
-  // "connecting" - never proactively from finalizeSession, which would
-  // create a gap where uploadActive is already false but feedStatus hasn't
-  // caught up yet, making backendConnected flicker back to false (and
-  // panels flash demo data) right as the real result is ready.
-  useEffect(() => {
-    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
-      setUploadActive(false);
-    }
-  }, [feedStatus]);
-
-  // Once a session actually finishes (writer already released server-side -
-  // see monitor.py's stop_session()/_finalize_session()), fetch the real
-  // annotated video for an upload flow so it can be replayed as many times
-  // as wanted without reprocessing. The report itself is downloaded on
-  // demand from the "Download report" button, not forced on the user here.
-  const finalizeSession = async () => {
+  // Once a session actually finishes, drop the drawing snapshot so the side
+  // panel switches from "draw a zone" back to the real recap ("Zones
+  // monitored"), instead of re-offering zone drawing for a session that is
+  // already over. Fetching the annotated video is the upload driver's job now
+  // (see startZoneUpload), so it still happens when this page isn't mounted.
+  const finalizeSession = () => {
     setSessionActive(false);
-    // Drop the drawing snapshot so the side panel switches from "draw a
-    // zone" back to the real recap ("Zones monitored") once finished,
-    // instead of re-offering zone drawing for a session that's already over.
     setZoneFrame(null);
-    const resolve = pendingUploadResolve.current;
-    pendingUploadResolve.current = null;
-    if (resolve) {
-      try {
-        const res = await fetch(`${RZ_BASE}/session/video`);
-        resolve(res.ok ? URL.createObjectURL(await res.blob()) : "");
-      } catch {
-        resolve("");
-      }
-      // uploadActive itself is cleared by the feedStatus effect above, once
-      // FeedPanel actually reflects the outcome - not here.
-    }
   };
 
   // Poll real status every second while a session is running - same cadence
@@ -264,7 +357,7 @@ function Intrusion() {
         if (!data.is_capturing) {
           // The source reached EOF on its own (uploaded file) rather than an
           // explicit Stop click - finalize the same way a manual stop does.
-          void finalizeSession();
+          finalizeSession();
         }
       } catch {
         // backend unreachable, keep last known status
@@ -308,6 +401,10 @@ function Intrusion() {
       setSavedZones(zones);
       setCurrentPoints([]);
       setSessionActive(true);
+      // Only claim the store for a plain camera run. During an upload the
+      // store already holds that upload's entry, and overwriting it would
+      // cancel the driver that is waiting to collect the processed video.
+      if (!uploadActive) setLiveSession("intrusion", "current");
     } finally {
       setStarting(false);
     }
@@ -315,11 +412,15 @@ function Intrusion() {
 
   const handleStopMonitoring = async () => {
     if (!sessionActive) return;
+    // An upload's own entry is left in place: its driver notices capturing has
+    // stopped, fetches the annotated video and resolves, exactly as it would
+    // if the clip had reached its end on its own.
+    if (!uploadActive) clearModuleSession("intrusion");
     // stop_session() on the backend joins the capture thread before
     // responding, so the annotated video is already fully written and
     // closed by the time this resolves - safe to fetch it right after.
     await stopZoneSession();
-    await finalizeSession();
+    finalizeSession();
   };
 
   const currentlyInside = status && "currently_inside" in status ? status.currently_inside : 0;
@@ -408,6 +509,8 @@ function Intrusion() {
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <FeedPanel
+          key={sessionReady ? "ready" : "restoring"}
+          {...restoreFeedProps("intrusion", sessionReady, restored)}
           title="Zone A perimeter camera"
           cameraCode="CAM-11"
           sample={feedWarehouse}
@@ -419,7 +522,9 @@ function Intrusion() {
             ? { busyLabel: "Starting monitoring" }
             : drawingZones
               ? { busyLabel: "Draw a restricted zone to the right" }
-              : {})}
+              : uploadLabel
+                ? { busyLabel: uploadLabel }
+                : {})}
           onStatusChange={setFeedStatus}
           onConnect={async () => {
             // A previous session's report may still be sitting unreported
@@ -434,27 +539,11 @@ function Intrusion() {
           onStop={async () => {
             await handleStopMonitoring();
           }}
-          onProcessMedia={(file) => {
-            setUploadActive(true);
-            return new Promise<string>((resolve) => {
-              pendingUploadResolve.current = resolve;
-              (async () => {
-                try {
-                  await wipeZoneData();
-                  await uploadZoneVideo(file);
-                  const frame = await fetchZoneFrame();
-                  setZoneFrame(frame);
-                  // Resolution is deferred until the session actually
-                  // finishes (see finalizeSession) - by then the real
-                  // annotated video is ready and replayable as many times
-                  // as wanted, never a raw unprocessed preview.
-                } catch {
-                  pendingUploadResolve.current = null;
-                  resolve(URL.createObjectURL(file));
-                }
-              })();
-            });
-          }}
+          // Resolves only once the session has actually finished and the real
+          // annotated video exists - never a raw unprocessed preview. The whole
+          // wait lives in the store driver, so it keeps running (and keeps
+          // reporting progress) while the user is on another page.
+          onProcessMedia={startZoneUpload}
           overlay={
             backendConnected ? undefined : (
               <>

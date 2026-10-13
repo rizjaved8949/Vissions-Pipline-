@@ -24,6 +24,17 @@ import {
 } from "@/components/ui/select";
 import { guardEvents, guardStateLabels, guardTimeline, type GuardState } from "@/lib/mock";
 import { cn } from "@/lib/utils";
+import {
+  asLiveEntry,
+  asUploadEntry,
+  clearModuleSession,
+  getModuleEntry,
+  initialFeedStatus,
+  restoreFeedProps,
+  runUpload,
+  setLiveSession,
+  useRestoredSession,
+} from "@/lib/session-store";
 import feedGuard from "@/assets/feed-guard.jpg";
 
 /* ---------------- backend wiring ---------------- */
@@ -135,6 +146,18 @@ async function stopGuardLiveSession(sessionId: string) {
   } catch {
     // Backend unreachable - nothing more we can do client-side.
   }
+}
+
+const DEAD_LIVE_STATUSES = new Set(["stopped", "stopping", "failed"]);
+
+/** Whether a session remembered from before the last navigation is still
+ *  running on the backend, so the page knows to re-attach to it. */
+async function guardLiveSessionIsRunning(sessionId: string): Promise<boolean> {
+  const res = await fetch(`${GUARD_BASE}/live`);
+  if (!res.ok) return false;
+  const data: { sessions?: Array<{ session_id: string; status: string }> } = await res.json();
+  const session = data.sessions?.find((s) => s.session_id === sessionId);
+  return !!session && !DEAD_LIVE_STATUSES.has(session.status);
 }
 
 async function stopGuardJob(jobId: string) {
@@ -270,6 +293,40 @@ function jobProgressLabel(status: JobStatusResponse): string {
     return `Processing video · ${status.frames_processed}/${status.total_frames} frames`;
   }
   return "Processing video";
+}
+
+/** Everything the page needs to render a finished upload, kept in the session
+ *  store so it survives the page being navigated away from. */
+type GuardUploadData = {
+  jobId: string;
+  summary: JobSummary;
+  events: RuleEvent[];
+  health: ModuleHealth;
+};
+
+/** Drives an upload to completion outside any component's lifetime, so
+ *  processing continues - and keeps reporting progress - while the user is on
+ *  another module's page. */
+function startGuardUpload(file: File) {
+  return runUpload<GuardUploadData>("guard", file, async (report) => {
+    report({ label: "Uploading video" });
+    const jobId = await createGuardJob(file);
+    report({ sessionId: jobId, label: "Processing video" });
+
+    const status = await waitForGuardJob(jobId, (s) => report({ label: jobProgressLabel(s) }));
+    if (status.status === "failed") {
+      throw new Error(status.error || "Guard processing failed");
+    }
+
+    report({ phase: "loading", label: "Loading processed video" });
+    const [url, summary, events, health] = await Promise.all([
+      fetchJobVideoUrl(jobId),
+      fetchJobSummary(jobId),
+      fetchJobEvents(jobId),
+      fetchJobModuleHealth(jobId),
+    ]);
+    return { url, data: { jobId, summary, events, health } };
+  });
 }
 
 /** Maps a triggered rule onto the existing 5-state vocabulary/icon set so real
@@ -427,7 +484,18 @@ const states: GuardState[] = ["on-duty", "standing", "sitting", "sleeping", "abs
 function Guard() {
   const [current, setCurrent] = useState<GuardState>("on-duty");
 
-  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  // Seeded from the store, not hardcoded to "demo": the wipe effects below key
+  // off feedStatus, so starting at "demo" would erase a restored result on the
+  // very first render.
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>(() =>
+    initialFeedStatus(getModuleEntry("guard")),
+  );
+
+  // A live session or an upload started before the user navigated away is still
+  // running on the backend; pick it back up instead of restarting at the demo feed.
+  const { ready: sessionReady, restored } = useRestoredSession("guard", guardLiveSessionIsRunning);
+  const liveEntry = asLiveEntry(restored);
+  const uploadEntry = asUploadEntry<GuardUploadData>(restored);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reportSessionId, setReportSessionId] = useState<string | null>(null);
@@ -437,19 +505,42 @@ function Guard() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobSummary, setJobSummary] = useState<JobSummary | null>(null);
   const [jobEvents, setJobEvents] = useState<RuleEvent[]>([]);
-  const [uploadLabel, setUploadLabel] = useState<string | undefined>(undefined);
-  const [processingJobId, setProcessingJobId] = useState<string | null>(null);
+
+  // Health of the backend's own detection/tracking/etc. modules for whichever
+  // session or job is active - lets the UI say *why* nothing was detected
+  // (e.g. a missing model file) instead of just showing an empty result.
+  const [moduleHealth, setModuleHealth] = useState<ModuleHealth | null>(null);
+
+  // Upload progress lives in the store so it keeps advancing while this page is
+  // unmounted, which is exactly what makes it survive a page change.
+  const uploadRunning = uploadEntry?.phase === "processing" || uploadEntry?.phase === "loading";
+  const uploadLabel = uploadEntry?.label;
+  const processingJobId = uploadRunning ? (uploadEntry?.sessionId ?? null) : null;
+
+  // Adopt the restored session's id once it has been confirmed still running,
+  // so the polling effects below treat it exactly like a freshly started one.
+  useEffect(() => {
+    if (!sessionReady || !liveEntry) return;
+    setSessionId(liveEntry.sessionId);
+    setReportSessionId(liveEntry.sessionId);
+  }, [sessionReady, liveEntry]);
+
+  // Re-seed the result panels from an upload that finished (possibly while the
+  // user was on another page).
+  useEffect(() => {
+    if (uploadEntry?.phase !== "done" || !uploadEntry.data) return;
+    const { jobId: doneJobId, summary, events, health } = uploadEntry.data;
+    setJobId(doneJobId);
+    setJobSummary(summary);
+    setJobEvents(events);
+    setModuleHealth(health);
+  }, [uploadEntry]);
 
   // True the moment a real camera/job is in play, including while an upload
   // is still processing - not just once results are fully ready. Keeps the
   // UI from falling back to demo mock data mid-processing (it shows real
   // panels with "no data yet" instead, once jobSummary/liveState land).
   const backendConnected = feedStatus === "live" || feedStatus === "media" || !!processingJobId;
-
-  // Health of the backend's own detection/tracking/etc. modules for whichever
-  // session or job is active - lets the UI say *why* nothing was detected
-  // (e.g. a missing model file) instead of just showing an empty result.
-  const [moduleHealth, setModuleHealth] = useState<ModuleHealth | null>(null);
 
   // Poll live state + events every second while a session is live, same
   // cadence Attendance uses for /api/status.
@@ -488,8 +579,12 @@ function Guard() {
     };
   }, [feedStatus, sessionId]);
 
-  // A stale processed job shouldn't linger once the user leaves "media".
+  // A stale processed job shouldn't linger once the user leaves "media" - but
+  // never clear a result the store is still holding, or returning to this page
+  // would wipe the finished upload it is there to restore.
+  const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
+    if (hasStoredResult) return;
     if (feedStatus !== "media") {
       setJobId(null);
       setJobSummary(null);
@@ -498,18 +593,7 @@ function Guard() {
     if (feedStatus !== "media" && feedStatus !== "live") {
       setModuleHealth(null);
     }
-  }, [feedStatus]);
-
-  // Only turn processingJobId off once feedStatus itself has actually left
-  // "connecting" - never from inside onProcessMedia's own finally block,
-  // which would create a gap where processingJobId is already null but
-  // feedStatus hasn't caught up yet, making backendConnected flicker back
-  // to false (and panels flash demo data) right as the real result is ready.
-  useEffect(() => {
-    if (feedStatus !== "connecting" && feedStatus !== "requesting") {
-      setProcessingJobId(null);
-    }
-  }, [feedStatus]);
+  }, [feedStatus, hasStoredResult]);
 
   // Real per-instant state while connected; the manual "Simulate state"
   // buttons still drive `current` for the demo feed exactly as before.
@@ -681,6 +765,8 @@ function Guard() {
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="space-y-4">
           <FeedPanel
+            key={sessionReady ? "ready" : "restoring"}
+            {...restoreFeedProps("guard", sessionReady, restored)}
             title="North post camera"
             cameraCode="CAM-09"
             sample={feedGuard}
@@ -698,10 +784,12 @@ function Guard() {
               const { session_id } = await startGuardLiveSession();
               setSessionId(session_id);
               setReportSessionId(session_id);
+              setLiveSession("guard", session_id);
             }}
             onStop={async () => {
               const camId = sessionId;
               setSessionId(null);
+              clearModuleSession("guard");
               if (camId) {
                 await stopGuardLiveSession(camId);
                 return;
@@ -719,36 +807,7 @@ function Guard() {
                 await stopGuardJob(processingJobId);
               }
             }}
-            onProcessMedia={async (file) => {
-              setUploadLabel("Uploading video");
-              try {
-                const newJobId = await createGuardJob(file);
-                setProcessingJobId(newJobId);
-                const status = await waitForGuardJob(newJobId, (s) =>
-                  setUploadLabel(jobProgressLabel(s)),
-                );
-                if (status.status === "failed") {
-                  throw new Error(status.error || "Guard processing failed");
-                }
-                setUploadLabel("Loading processed video");
-                const [url, summary, events, health] = await Promise.all([
-                  fetchJobVideoUrl(newJobId),
-                  fetchJobSummary(newJobId),
-                  fetchJobEvents(newJobId),
-                  fetchJobModuleHealth(newJobId),
-                ]);
-                setJobId(newJobId);
-                setJobSummary(summary);
-                setJobEvents(events);
-                setModuleHealth(health);
-                return url;
-              } finally {
-                // processingJobId itself is cleared by the feedStatus effect
-                // above, once FeedPanel actually reflects the outcome - not
-                // here.
-                setUploadLabel(undefined);
-              }
-            }}
+            onProcessMedia={startGuardUpload}
             overlay={
               feedStatus === "live" ||
               feedStatus === "media" ||

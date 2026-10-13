@@ -27,6 +27,16 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { faceBoxes } from "@/lib/mock";
+import {
+  asUploadEntry,
+  clearModuleSession,
+  getModuleEntry,
+  initialFeedStatus,
+  restoreFeedProps,
+  runUpload,
+  setLiveSession,
+  useRestoredSession,
+} from "@/lib/session-store";
 import feedLobby from "@/assets/feed-lobby.jpg";
 
 const API_BASE = "http://localhost:8000";
@@ -56,6 +66,17 @@ async function stopBackendSession() {
   } catch {
     // Backend unreachable - nothing more we can do client-side.
   }
+}
+
+/** Whether a session remembered from before the last navigation is still
+ *  capturing on the backend, so the page knows to re-attach to it. Attendance
+ *  runs a single global session rather than one per id, so the remembered id
+ *  is only a marker - /api/status is the real answer. */
+async function attendanceSessionIsRunning(): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/status`);
+  if (!res.ok) return false;
+  const data: { is_capturing?: boolean } = await res.json();
+  return data.is_capturing === true;
 }
 
 type ReportFormat = "PDF" | "CSV";
@@ -158,15 +179,70 @@ function base64ToBlob(base64: string, mediaType: string): Blob {
   return new Blob([bytes], { type: mediaType });
 }
 
-async function processMediaOnBackend(
-  file: File,
-): Promise<{ url: string; summary: MediaSummary; filename: string }> {
+type MediaJobStatus = {
+  job_id: string;
+  status: "queued" | "processing" | "completed" | "failed" | "stopped";
+  processed_frames: number;
+  total_frames: number | null;
+  error: string | null;
+};
+
+async function createMediaJob(file: File): Promise<string> {
   const body = new FormData();
   body.append("file", file);
-  const res = await fetch(`${API_BASE}/api/process_media`, { method: "POST", body });
+  const res = await fetch(`${API_BASE}/api/media_jobs`, { method: "POST", body });
   if (!res.ok) {
     const detail = await res.json().catch(() => null);
-    throw new Error(detail?.detail || "Failed to process media");
+    throw new Error(detail?.detail || "Failed to start processing");
+  }
+  const data: MediaJobStatus = await res.json();
+  return data.job_id;
+}
+
+async function fetchMediaJob(jobId: string): Promise<MediaJobStatus> {
+  const res = await fetch(`${API_BASE}/api/media_jobs/${jobId}`);
+  if (!res.ok) throw new Error("Failed to fetch processing status");
+  return res.json();
+}
+
+async function stopMediaJob(jobId: string) {
+  try {
+    await fetch(`${API_BASE}/api/media_jobs/${jobId}/stop`, { method: "POST" });
+  } catch {
+    // Backend unreachable - nothing more we can do client-side.
+  }
+}
+
+/** Whether a job remembered from before the last navigation is still running
+ *  on the backend, so the page knows to re-attach to it. */
+async function mediaJobIsRunning(jobId: string): Promise<boolean> {
+  try {
+    const s = await fetchMediaJob(jobId);
+    return s.status === "processing" || s.status === "queued";
+  } catch {
+    return false;
+  }
+}
+
+async function waitForMediaJob(
+  jobId: string,
+  onProgress?: (status: MediaJobStatus) => void,
+): Promise<MediaJobStatus> {
+  for (;;) {
+    const status = await fetchMediaJob(jobId);
+    onProgress?.(status);
+    if (status.status !== "queued" && status.status !== "processing") return status;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+async function fetchMediaJobResult(
+  jobId: string,
+): Promise<{ url: string; summary: MediaSummary; filename: string }> {
+  const res = await fetch(`${API_BASE}/api/media_jobs/${jobId}/result`);
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail || "Failed to load the processed media");
   }
   const data: {
     media_type: string;
@@ -177,6 +253,41 @@ async function processMediaOnBackend(
 
   const blob = base64ToBlob(data.media_base64, data.media_type);
   return { url: URL.createObjectURL(blob), summary: data.summary, filename: data.source_filename };
+}
+
+function mediaProgressLabel(status: MediaJobStatus): string {
+  if (status.total_frames) {
+    const pct = Math.round((status.processed_frames / status.total_frames) * 100);
+    return `Processing media · ${pct}%`;
+  }
+  return "Processing media";
+}
+
+/** Everything the page needs to render a finished upload, kept in the session
+ *  store so it survives the page being navigated away from. */
+type AttendanceUploadData = {
+  summary: MediaSummary;
+  filename: string;
+};
+
+/** Drives an upload to completion outside any component's lifetime, so
+ *  processing continues - and keeps reporting progress - while the user is on
+ *  another module's page. */
+function startAttendanceUpload(file: File) {
+  return runUpload<AttendanceUploadData>("attendance", file, async (report) => {
+    report({ label: "Uploading media" });
+    const jobId = await createMediaJob(file);
+    report({ sessionId: jobId, label: "Processing media" });
+
+    const status = await waitForMediaJob(jobId, (s) => report({ label: mediaProgressLabel(s) }));
+    if (status.status === "failed") {
+      throw new Error(status.error || "Media processing failed");
+    }
+
+    report({ phase: "loading", label: "Loading processed media" });
+    const { url, summary, filename } = await fetchMediaJobResult(jobId);
+    return { url, data: { summary, filename } };
+  });
 }
 
 export const Route = createFileRoute("/attendance")({
@@ -259,17 +370,48 @@ function Attendance() {
     if (!regOpen) stopRegCamera();
   }, [regOpen]);
 
-  const [feedStatus, setFeedStatus] = useState<FeedStatus>("demo");
+  // Seeded from the store, not hardcoded to "demo": the wipe effect below keys
+  // off feedStatus, so starting at "demo" would erase a restored result on the
+  // very first render.
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>(() =>
+    initialFeedStatus(getModuleEntry("attendance")),
+  );
+
+  // A live session or an upload started before the user navigated away is still
+  // running on the backend; pick it back up instead of the demo feed. Live
+  // sessions are confirmed against /api/status; an upload is re-attached to via
+  // its job id.
+  const { ready: sessionReady, restored } = useRestoredSession(
+    "attendance",
+    attendanceSessionIsRunning,
+  );
+  const uploadEntry = asUploadEntry<AttendanceUploadData>(restored);
+
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
   const [mediaSummary, setMediaSummary] = useState<MediaSummary | null>(null);
   const [mediaFilename, setMediaFilename] = useState("upload");
+
+  // Upload progress lives in the store so it keeps advancing while this page is
+  // unmounted, which is exactly what makes it survive a page change.
+  const uploadLabel = uploadEntry?.label;
+  const processingUpload = uploadEntry?.phase === "processing" || uploadEntry?.phase === "loading";
+  const processingJobId = processingUpload ? (uploadEntry?.sessionId ?? null) : null;
+
+  // Re-seed the result panels from an upload that finished (possibly while the
+  // user was on another page).
+  useEffect(() => {
+    if (uploadEntry?.phase !== "done" || !uploadEntry.data) return;
+    setMediaSummary(uploadEntry.data.summary);
+    setMediaFilename(uploadEntry.data.filename);
+  }, [uploadEntry]);
   const [sessionReportOpen, setSessionReportOpen] = useState(false);
   const [livePeople, setLivePeople] = useState<LivePerson[] | null>(null);
   const [hasEnrolledPeople, setHasEnrolledPeople] = useState(false);
   const isLiveSource = feedStatus === "live";
   // True whenever the feed panel is showing real backend output (a live
-  // session or a processed upload), as opposed to the demo/mock feed.
-  const backendConnected = feedStatus === "live" || feedStatus === "media";
+  // session or a processed upload), as opposed to the demo/mock feed. Includes
+  // an upload still processing, so the panels don't flash demo data mid-run.
+  const backendConnected = feedStatus === "live" || feedStatus === "media" || processingUpload;
 
   const refreshEnrolledPeople = async () => {
     try {
@@ -292,8 +434,16 @@ function Attendance() {
   // the "media" view (e.g. clears the upload or goes back to demo). If they
   // leave without having downloaded anything, wipe server-side data now -
   // it was only ever going to be useful for the view they just left.
-  const prevFeedStatus = useRef<FeedStatus>("demo");
+  // Seeded with the restored status too, so arriving back on a finished upload
+  // isn't mistaken for having just left the media view - which would wipe the
+  // backend data behind the result being restored.
+  const prevFeedStatus = useRef<FeedStatus>(feedStatus);
+  const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
+    if (hasStoredResult) {
+      prevFeedStatus.current = feedStatus;
+      return;
+    }
     const leavingMedia = prevFeedStatus.current === "media" && feedStatus !== "media";
     prevFeedStatus.current = feedStatus;
 
@@ -305,7 +455,7 @@ function Attendance() {
         setHasEnrolledPeople(false);
       });
     }
-  }, [feedStatus]);
+  }, [feedStatus, hasStoredResult]);
 
   useEffect(() => {
     if (!isLiveSource) {
@@ -445,13 +595,29 @@ function Attendance() {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="space-y-3">
           <FeedPanel
+            key={sessionReady ? "ready" : "restoring"}
+            {...restoreFeedProps("attendance", sessionReady, restored)}
             title="Entrance recognition feed"
             cameraCode="CAM-01"
             sample={feedLobby}
             sampleAlt="Front entrance lobby camera feed"
             liveSrc={`${API_BASE}/api/video_feed`}
-            onConnect={startBackendSession}
+            {...(uploadLabel ? { busyLabel: uploadLabel } : {})}
+            onConnect={async () => {
+              await startBackendSession();
+              setLiveSession("attendance", "current");
+            }}
             onStop={async () => {
+              const jobId = processingJobId;
+              clearModuleSession("attendance");
+              // An upload still processing (FeedPanel shows "Stop session"
+              // during "connecting" too) - signal the job to stop so it ends
+              // early instead of running the whole clip out and popping up a
+              // finished video the user no longer asked for.
+              if (jobId) {
+                await stopMediaJob(jobId);
+                return;
+              }
               await stopBackendSession();
               // Nothing is wiped yet - show the report dialog first; wiping
               // happens once a format is actually generated (or the dialog
@@ -471,12 +637,7 @@ function Attendance() {
               });
               setRegOpen(true);
             }}
-            onProcessMedia={async (file) => {
-              const { url, summary, filename } = await processMediaOnBackend(file);
-              setMediaSummary(summary);
-              setMediaFilename(filename);
-              return url;
-            }}
+            onProcessMedia={startAttendanceUpload}
             onDownload={() => {
               // Downloading the raw processed result (not the report) still
               // wipes right away - only the report has a dialog gating it.

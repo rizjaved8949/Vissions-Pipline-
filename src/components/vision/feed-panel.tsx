@@ -37,6 +37,13 @@ type SampleVideo = { name: string; url: string };
 export type FeedStatus =
   "idle" | "requesting" | "connecting" | "live" | "demo" | "stopped" | "media" | "error";
 
+/** Name and type of a processed upload's output, known from the picked file
+ *  before processing finishes. */
+export type MediaOutput = { kind: "image" | "video"; name: string };
+
+/** A finished processed upload, ready to play back. */
+export type ProcessedMedia = MediaOutput & { url: string };
+
 type FeedPanelProps = {
   title: string;
   sample: string;
@@ -79,6 +86,18 @@ type FeedPanelProps = {
    *  same live feed rather than handing back one finished file (e.g. a
    *  session that keeps running after onProcessMedia resolves). */
   liveOverride?: boolean;
+  /** Starting status, for restoring a session that was already live before the
+   *  user navigated away. Only read on mount - pass it through a changing
+   *  `key` to re-apply it. Defaults to the demo feed. */
+  initialStatus?: FeedStatus;
+  /** A finished processed result to show immediately on mount, restoring an
+   *  upload that completed before (or while) the user was on another page.
+   *  Pair with `initialStatus: "media"`. Only read on mount. */
+  initialUpload?: ProcessedMedia;
+  /** An upload still being processed, to re-attach to rather than restart.
+   *  The panel re-enters its "processing" state and awaits this same promise,
+   *  so the work is never duplicated. Only read on mount. */
+  resumeUpload?: { promise: Promise<string>; output: MediaOutput };
   /** Restricts the "Sample videos" dropdown to clips whose filename contains
    *  this keyword (e.g. "Guard", "Kitchen") - so one module's sample footage
    *  never shows up on another module's page. Omit it and no sample videos
@@ -116,20 +135,24 @@ export function FeedPanel({
   onDownload,
   busyLabel,
   liveOverride = false,
+  initialStatus,
+  initialUpload,
+  resumeUpload,
   sampleVideosModule,
 }: FeedPanelProps) {
-  const [status, setStatus] = useState<FeedStatus>("demo");
+  const [status, setStatus] = useState<FeedStatus>(initialStatus ?? "demo");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState<string>("");
   const [errorText, setErrorText] = useState("");
-  const [upload, setUpload] = useState<{
-    url: string;
-    kind: "image" | "video";
-    name: string;
-  } | null>(null);
+  const [upload, setUpload] = useState<ProcessedMedia | null>(initialUpload ?? null);
   const [dragging, setDragging] = useState(false);
   const [clock, setClock] = useState("--:--:--");
   const [feedRetry, setFeedRetry] = useState(0);
+  // Distinguishes this mount's stream request from the previous one. An MJPEG
+  // <img> pointed at a constant URL can be served the prior (aborted) response
+  // from cache, repainting the frame the feed was last showing before the new
+  // connection delivers one - which reads as a frozen feed on page return.
+  const streamNonceRef = useRef(Date.now());
   const [sampleVideos, setSampleVideos] = useState<SampleVideo[]>([]);
   const [loadingSample, setLoadingSample] = useState(false);
 
@@ -304,6 +327,33 @@ export function FeedPanel({
     onDownload?.();
   };
 
+  /** The one path from "processing" to a playable result, shared by a fresh
+   *  upload and by re-attaching to one that outlived a page change. */
+  const awaitProcessed = useCallback(
+    async (promise: Promise<string>, output: MediaOutput, describe?: string) => {
+      setStatus("connecting");
+      try {
+        const processedUrl = await promise;
+        setUpload({ url: processedUrl, kind: output.kind, name: output.name });
+        setStatus("media");
+        toast.success("Media processed", describe ? { description: describe } : undefined);
+      } catch {
+        setStatus("error");
+        setErrorText("Could not process the uploaded media. You can continue on the demo feed.");
+        toast.error("Processing failed");
+      }
+    },
+    [],
+  );
+
+  // Re-attach once, on mount, to an upload that was already running.
+  const resumedRef = useRef(false);
+  useEffect(() => {
+    if (!resumeUpload || resumedRef.current) return;
+    resumedRef.current = true;
+    void awaitProcessed(resumeUpload.promise, resumeUpload.output);
+  }, [resumeUpload, awaitProcessed]);
+
   const handleFile = async (file?: File) => {
     if (!file) return;
     if (!(await passesGuard())) return;
@@ -312,19 +362,9 @@ export function FeedPanel({
     stopStream();
 
     if (onProcessMedia) {
-      setStatus("connecting");
-      try {
-        const processedUrl = await onProcessMedia(file);
-        const base = file.name.replace(/\.[^./]+$/, "");
-        const outName = `${base}-processed.${kind === "video" ? "mp4" : "jpg"}`;
-        setUpload({ url: processedUrl, kind, name: outName });
-        setStatus("media");
-        toast.success("Media processed", { description: file.name });
-      } catch {
-        setStatus("error");
-        setErrorText("Could not process the uploaded media. You can continue on the demo feed.");
-        toast.error("Processing failed");
-      }
+      const base = file.name.replace(/\.[^./]+$/, "");
+      const outName = `${base}-processed.${kind === "video" ? "mp4" : "jpg"}`;
+      await awaitProcessed(onProcessMedia(file), { kind, name: outName }, file.name);
       return;
     }
 
@@ -352,6 +392,9 @@ export function FeedPanel({
   const info = statusCopy[status];
   const liveOverrideActive = liveOverride && (status === "media" || status === "connecting");
   const showLiveSrc = (status === "live" || liveOverrideActive) && !!liveSrc;
+  const liveSrcUrl = liveSrc
+    ? `${liveSrc}${liveSrc.includes("?") ? "&" : "?"}_s=${streamNonceRef.current}-${feedRetry}`
+    : undefined;
   const showOverlay =
     status === "live" || status === "demo" || status === "media" || liveOverrideActive;
   const isLive = status === "live" || status === "demo" || liveOverrideActive;
@@ -392,7 +435,7 @@ export function FeedPanel({
           {showLiveSrc ? (
             <img
               key={feedRetry}
-              src={liveSrc}
+              src={liveSrcUrl}
               alt={`${cameraCode} live feed`}
               className="absolute inset-0 size-full bg-ink object-contain"
               onError={() => {
