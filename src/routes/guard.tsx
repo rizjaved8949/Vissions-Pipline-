@@ -70,6 +70,9 @@ type LiveStats = {
   stationary_frames: number;
   sleep_candidate_frames: number;
   absence_frames: number;
+  /** Present, moving and awake - the complement of the stationary/sleeping/
+   *  absent counts, so active and inactive time share a denominator. */
+  active_frames: number;
 };
 
 type LiveState = {
@@ -96,6 +99,12 @@ type JobSummary = {
   stationary_frames: number;
   sleep_candidate_frames: number;
   absence_frames: number;
+  /** Present, moving and awake - the complement of the stationary/sleeping/
+   *  absent counts, so active and inactive time share a denominator. */
+  active_frames: number;
+  /** True while this is a running tally published mid-job rather than the
+   *  final summary written when the run ends. */
+  partial?: boolean;
 };
 
 type ModuleHealth = Record<
@@ -584,7 +593,9 @@ function Guard() {
   // would wipe the finished upload it is there to restore.
   const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
-    if (hasStoredResult) return;
+    // Never clear while an upload is mid-flight: the running tally polled below
+    // is live job data, not a leftover from a previous one.
+    if (hasStoredResult || processingJobId) return;
     if (feedStatus !== "media") {
       setJobId(null);
       setJobSummary(null);
@@ -593,7 +604,36 @@ function Guard() {
     if (feedStatus !== "media" && feedStatus !== "live") {
       setModuleHealth(null);
     }
-  }, [feedStatus, hasStoredResult]);
+  }, [feedStatus, hasStoredResult, processingJobId]);
+
+  // While an uploaded video is still being analysed the pipeline publishes a
+  // running tally on every progress tick, and events.jsonl is flushed per line -
+  // so poll both and let the KPIs, timeline and alert list fill in as the video
+  // is processed rather than all at once when it finishes.
+  useEffect(() => {
+    if (!processingJobId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const summary = await fetchJobSummary(processingJobId);
+        if (!cancelled) setJobSummary(summary);
+      } catch {
+        // 409 until the first progress tick is stored - not an error.
+      }
+      try {
+        const events = await fetchJobEvents(processingJobId);
+        if (!cancelled) setJobEvents(events);
+      } catch {
+        // 409 until the first event fires - not an error.
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [processingJobId]);
 
   // Real per-instant state while connected; the manual "Simulate state"
   // buttons still drive `current` for the demo feed exactly as before.
@@ -625,7 +665,7 @@ function Guard() {
     if (!backendConnected) return null;
     const emptyGuardStats = {
       dutySeconds: 0,
-      alertSeconds: 0,
+      activeSeconds: 0,
       inactiveSeconds: 0,
       sleepSeconds: 0,
       absenceSeconds: 0,
@@ -637,7 +677,7 @@ function Guard() {
       const stats = liveState.stats;
       return {
         dutySeconds: liveState.uptime_seconds,
-        alertSeconds: stats.visible_frames / fps,
+        activeSeconds: stats.active_frames / fps,
         inactiveSeconds: stats.stationary_frames / fps,
         sleepSeconds: stats.sleep_candidate_frames / fps,
         absenceSeconds: stats.absence_frames / fps,
@@ -645,11 +685,14 @@ function Guard() {
         absenceEvents: eventCount(liveEvents, "absence"),
       };
     }
-    if (feedStatus === "media" && jobSummary) {
+    // Not gated on "media": while an upload is still processing the pipeline
+    // publishes a running tally, so these fill in as the video is analysed
+    // instead of staying at zero until the job ends.
+    if (jobSummary) {
       const fps = jobSummary.fps || 25;
       return {
         dutySeconds: jobSummary.frames_processed / fps,
-        alertSeconds: jobSummary.guard_visible_frames / fps,
+        activeSeconds: jobSummary.active_frames / fps,
         inactiveSeconds: jobSummary.stationary_frames / fps,
         sleepSeconds: jobSummary.sleep_candidate_frames / fps,
         absenceSeconds: jobSummary.absence_frames / fps,
@@ -871,14 +914,14 @@ function Guard() {
               }
             />
             <Kpi
-              label="Alert time"
-              value={guardStats ? fmtSeconds(guardStats.alertSeconds) : "4h 51m"}
+              label="Active time"
+              value={guardStats ? fmtSeconds(guardStats.activeSeconds) : "4h 51m"}
               tone="moss"
               hint={
                 guardStats
                   ? `${
                       guardStats.dutySeconds > 0
-                        ? Math.round((guardStats.alertSeconds / guardStats.dutySeconds) * 100)
+                        ? Math.round((guardStats.activeSeconds / guardStats.dutySeconds) * 100)
                         : 0
                     }% of duty time`
                   : "85% of shift"
