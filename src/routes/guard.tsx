@@ -678,7 +678,11 @@ function Guard() {
       return {
         dutySeconds: liveState.uptime_seconds,
         activeSeconds: stats.active_frames / fps,
-        inactiveSeconds: stats.stationary_frames / fps,
+        // Everything that wasn't active, so the two always account for the
+        // whole duty time. Deliberately NOT stationary_frames: that is one
+        // specific sub-condition which overlaps with sleeping, so using it
+        // left the rest of the time (mostly sleep) unaccounted for.
+        inactiveSeconds: Math.max(0, liveState.uptime_seconds - stats.active_frames / fps),
         sleepSeconds: stats.sleep_candidate_frames / fps,
         absenceSeconds: stats.absence_frames / fps,
         sleepEvents: eventCount(liveEvents, "sleep"),
@@ -693,7 +697,14 @@ function Guard() {
       return {
         dutySeconds: jobSummary.frames_processed / fps,
         activeSeconds: jobSummary.active_frames / fps,
-        inactiveSeconds: jobSummary.stationary_frames / fps,
+        // Everything that wasn't active, so the two always account for the
+        // whole duty time. Deliberately NOT stationary_frames: that is one
+        // specific sub-condition which overlaps with sleeping, so using it
+        // left the rest of the time (mostly sleep) unaccounted for.
+        inactiveSeconds: Math.max(
+          0,
+          (jobSummary.frames_processed - jobSummary.active_frames) / fps,
+        ),
         sleepSeconds: jobSummary.sleep_candidate_frames / fps,
         absenceSeconds: jobSummary.absence_frames / fps,
         sleepEvents: eventCount(jobEvents, "sleep"),
@@ -931,7 +942,15 @@ function Guard() {
               label="Inactive time"
               value={guardStats ? fmtSeconds(guardStats.inactiveSeconds) : "45m"}
               tone="amber"
-              hint="seated periods"
+              hint={
+                guardStats
+                  ? `${
+                      guardStats.dutySeconds > 0
+                        ? Math.round((guardStats.inactiveSeconds / guardStats.dutySeconds) * 100)
+                        : 0
+                    }% - sleeping, idle or absent`
+                  : "seated periods"
+              }
             />
             <Kpi
               label="Sleep events"
