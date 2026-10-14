@@ -64,6 +64,10 @@ type PlateRecordReal = {
   timestamp: string | null;
   image_url: string | null;
   raw_image_url: string | null;
+  /** Still being tracked: the crop is the best raw one so far and carries no
+   *  scores yet. It is replaced by the enhanced result once the track
+   *  finalizes, so it is marked rather than shown as a finished read. */
+  pending?: boolean;
 };
 
 type JobStatusResponse = {
@@ -342,21 +346,27 @@ function Plates() {
     };
   }, [activeStreamJobId]);
 
+  // Rows still being tracked show up in the list so detections are visible as
+  // they happen, but they are not counted anywhere: nothing has been saved or
+  // scored for them yet, and counting them would make the KPIs jump around and
+  // then drop back as tracks resolve.
+  const savedPlates = useMemo(() => plates.filter((p) => !p.pending), [plates]);
+
   const vehicleCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const p of plates) {
+    for (const p of savedPlates) {
       const v = p.vehicle || "unknown";
       counts[v] = (counts[v] || 0) + 1;
     }
     return counts;
-  }, [plates]);
+  }, [savedPlates]);
 
   // Real per-hour histogram derived from each plate's own timestamp - no
   // backend bucketing needed, it's directly computable from real data.
   const trendData = useMemo(() => {
     if (!backendConnected) return plateTraffic;
     const buckets = new Map<number, { cars: number; bikes: number }>();
-    for (const p of plates) {
+    for (const p of savedPlates) {
       const h = hourOf(p.timestamp);
       if (h === null) continue;
       const b = buckets.get(h) || { cars: 0, bikes: 0 };
@@ -367,7 +377,7 @@ function Plates() {
     return [...buckets.entries()]
       .sort(([a], [b]) => a - b)
       .map(([h, b]) => ({ hour: `${String(h).padStart(2, "0")}:00`, ...b }));
-  }, [backendConnected, plates]);
+  }, [backendConnected, savedPlates]);
 
   const rows = useMemo(() => {
     if (backendConnected) {
@@ -558,7 +568,7 @@ function Plates() {
           <div className="grid grid-cols-2 gap-3">
             <Kpi
               label="Vehicles tracked"
-              value={backendConnected ? plates.length : 149}
+              value={backendConnected ? savedPlates.length : 149}
               hint={backendConnected ? "this video" : "both lanes"}
             />
             <Kpi
@@ -579,7 +589,9 @@ function Plates() {
             />
             <Kpi
               label="Needs review"
-              value={backendConnected ? plates.filter((p) => p.low_conf).length : uniqueDemo + 121}
+              value={
+                backendConnected ? savedPlates.filter((p) => p.low_conf).length : uniqueDemo + 121
+              }
               tone={backendConnected ? "rose" : "moss"}
               hint={backendConnected ? "low confidence" : "12 repeat visitors"}
             />
@@ -701,10 +713,14 @@ function Plates() {
                       Track #{p.track_id} · {p.vehicle || "vehicle"}
                     </p>
                     <p className="truncate font-mono text-[10px] text-mute">
-                      quality {Math.round((p.quality ?? 0) * 100)}% · {formatTimestamp(p.timestamp)}
+                      {p.pending
+                        ? `still in view · ${formatTimestamp(p.timestamp)}`
+                        : `quality ${Math.round((p.quality ?? 0) * 100)}% · ${formatTimestamp(p.timestamp)}`}
                     </p>
                   </div>
-                  {p.low_conf ? (
+                  {p.pending ? (
+                    <Chip tone="amber">detecting</Chip>
+                  ) : p.low_conf ? (
                     <Chip tone="rose">needs review</Chip>
                   ) : (
                     <Chip tone={(p.plate_conf ?? 0) > 0.7 ? "moss" : "amber"}>
