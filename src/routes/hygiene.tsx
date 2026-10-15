@@ -403,12 +403,43 @@ function Hygiene() {
   // restore.
   const hasStoredResult = uploadEntry?.phase === "done";
   useEffect(() => {
-    if (hasStoredResult) return;
+    // Never clear while an upload is mid-flight: the dashboard polled below is
+    // live session data, not a leftover from a previous run.
+    if (hasStoredResult || processingSessionId) return;
     if (feedStatus !== "media" && feedStatus !== "live") {
       setDashboard(null);
       setViolationsLog([]);
     }
-  }, [feedStatus, hasStoredResult]);
+  }, [feedStatus, hasStoredResult, processingSessionId]);
+
+  // The backend writes compliance rows as it analyses, so poll while an upload
+  // is still processing - that is what fills the KPIs, compliance chart,
+  // per-person list and violation feed as detections happen, instead of leaving
+  // them on "Processing..." until the whole video is done.
+  useEffect(() => {
+    if (!processingSessionId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await fetchKitchenDashboard(processingSessionId);
+        if (!cancelled) setDashboard(data);
+      } catch {
+        // Not ready yet (or backend unreachable) - keep the last known values.
+      }
+      try {
+        const log = await fetchKitchenViolations(processingSessionId);
+        if (!cancelled) setViolationsLog(log);
+      } catch {
+        // Not ready yet (or backend unreachable) - keep the last known values.
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [processingSessionId]);
 
   const [severity, setSeverity] = useState("all");
   const [complianceFilter, setComplianceFilter] = useState("all");
