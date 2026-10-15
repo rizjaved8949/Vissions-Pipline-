@@ -148,11 +148,13 @@ export function FeedPanel({
   const [dragging, setDragging] = useState(false);
   const [clock, setClock] = useState("--:--:--");
   const [feedRetry, setFeedRetry] = useState(0);
-  // Distinguishes this mount's stream request from the previous one. An MJPEG
-  // <img> pointed at a constant URL can be served the prior (aborted) response
-  // from cache, repainting the frame the feed was last showing before the new
-  // connection delivers one - which reads as a frozen feed on page return.
-  const streamNonceRef = useRef(Date.now());
+  // Distinguishes each stream request from the previous one. An MJPEG <img>
+  // pointed at a constant URL can be served the prior (aborted) response from
+  // cache, repainting the frame the feed was last showing before the new
+  // connection delivers one - which reads as a frozen feed. Refreshed on every
+  // (re)connect, not just per mount: a live feed's URL is fixed, so stopping
+  // and reconnecting within one visit would otherwise reuse the same URL.
+  const [streamNonce, setStreamNonce] = useState(() => Date.now());
   const [sampleVideos, setSampleVideos] = useState<SampleVideo[]>([]);
   const [loadingSample, setLoadingSample] = useState(false);
 
@@ -392,8 +394,13 @@ export function FeedPanel({
   const info = statusCopy[status];
   const liveOverrideActive = liveOverride && (status === "media" || status === "connecting");
   const showLiveSrc = (status === "live" || liveOverrideActive) && !!liveSrc;
+
+  // A new stream is starting - give it a URL the cache has never seen.
+  useEffect(() => {
+    if (showLiveSrc) setStreamNonce(Date.now());
+  }, [showLiveSrc]);
   const liveSrcUrl = liveSrc
-    ? `${liveSrc}${liveSrc.includes("?") ? "&" : "?"}_s=${streamNonceRef.current}-${feedRetry}`
+    ? `${liveSrc}${liveSrc.includes("?") ? "&" : "?"}_s=${streamNonce}-${feedRetry}`
     : undefined;
   const showOverlay =
     status === "live" || status === "demo" || status === "media" || liveOverrideActive;
@@ -434,7 +441,7 @@ export function FeedPanel({
           {/* base layer */}
           {showLiveSrc ? (
             <img
-              key={feedRetry}
+              key={`${streamNonce}-${feedRetry}`}
               src={liveSrcUrl}
               alt={`${cameraCode} live feed`}
               className="absolute inset-0 size-full bg-ink object-contain"
